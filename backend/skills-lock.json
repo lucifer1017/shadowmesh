@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "skills": {
+    "swap-integration": {
+      "source": "Uniswap/uniswap-ai",
+      "sourceType": "github",
+      "computedHash": "24f7b392393d49d65e9d92932ed9f99388a45f120c130b5ff1d70dd0c40e8680"
+    },
+    "v4-hook-generator": {
+      "source": "Uniswap/uniswap-ai",
+      "sourceType": "github",
+      "computedHash": "5cf9923b8b2ba874ba83b08dd160f1065378a5077548d8c5d1b9d3a44d781fe6"
+    },
+    "v4-security-foundations": {
+      "source": "Uniswap/uniswap-ai",
+      "sourceType": "github",
+      "computedHash": "d8f2966c62325b7606285614050c8424354b5da1af6250df31cdd67cbb4ffde9"
+    },
+    "viem-integration": {
+      "source": "Uniswap/uniswap-ai",
+      "sourceType": "github",
+      "computedHash": "a85bccc1cc620e6b157941d877aa55133954340bb97e9c90244af89840f3269b"
+    }
+  }
+}
