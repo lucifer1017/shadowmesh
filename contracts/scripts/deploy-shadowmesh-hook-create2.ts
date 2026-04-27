@@ -28,7 +28,7 @@ type ShadowMeshParameters = {
 
 function requireAddress(value: string | undefined, name: string): Address {
   if (value === undefined || !isAddress(value) || getAddress(value) === ZERO_ADDRESS) {
-    throw new Error(`Missing or invalid ${name} in ignition/parameters.json`);
+    throw new Error(`Missing or invalid ${name} in .env (or fallback ignition/parameters.json)`);
   }
   return getAddress(value);
 }
