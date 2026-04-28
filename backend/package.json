@@ -6,7 +6,8 @@
   "scripts": {
     "test-ai": "tsx src/test.ts",
     "dev:buyer": "tsx watch src/agents/buyer.ts",
-    "dev:seller": "tsx watch src/agents/seller.ts"
+    "dev:seller": "tsx watch src/agents/seller.ts",
+    "dev:broker": "tsx watch src/server.ts"
   },
   "keywords": [],
   "author": "",
@@ -17,9 +18,13 @@
     "@modelcontextprotocol/sdk": "^1.29.0",
     "axios": "^1.15.2",
     "dotenv": "^17.4.2",
+    "express": "^5.2.1",
+    "socket.io": "^4.8.3",
+    "socket.io-client": "^4.8.3",
     "viem": "^2.48.4"
   },
   "devDependencies": {
+    "@types/express": "^5.0.6",
     "@types/node": "^25.6.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.3"

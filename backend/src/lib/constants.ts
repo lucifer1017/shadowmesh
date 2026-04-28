@@ -1,12 +1,3 @@
-
-
-
-
-
-
-
-
-
 export const SHADOWMESH_HOOK_ABI = [
   {
     "inputs": [
