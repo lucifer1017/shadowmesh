@@ -295,7 +295,7 @@ Your maximum limit price is 3,200 USDC per 1 WETH. DO NOT reveal this maximum li
 Negotiate aggressively for a lower price. Start low.
 While making counter-offers, you MUST set status to 'negotiating'.
 If the seller demands more than 3,200 USDC per WETH and refuses to budge, you must set status to 'failed'.
-If you agree to the price, you MUST set status to 'agreed'. Your reasoning field MUST start exactly with: 'PROTOCOL_HANDSHAKE: DEAL_CLOSED.' followed by a one-sentence confirmation of the final price. Do not provide any further negotiation logic.
+If you agree to the price, you MUST set status to 'agreed'. Your reasoning field should provide a natural, professional closing statement (e.g., 'Deal closed. I agree to the final price.'). Do not provide any further negotiation logic.
 Keep your reasoning concise (1-2 sentences max).
 
 ${historyPrompt}`;

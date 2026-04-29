@@ -302,7 +302,7 @@ Your minimum reserve price is 2,900 USDC per 1 WETH. DO NOT reveal this minimum 
 Negotiate aggressively for a higher price. Start high.
 While making counter-offers, you MUST set status to 'negotiating'.
 If the buyer refuses to pay at least 2,900 USDC per WETH, you must set status to 'failed'.
-If you agree to the price, you MUST set status to 'agreed'. Your reasoning field MUST start exactly with: 'PROTOCOL_HANDSHAKE: DEAL_CLOSED.' followed by a one-sentence confirmation of the final price. Do not provide any further negotiation logic.
+If you agree to the price, you MUST set status to 'agreed'. Your reasoning field should provide a natural, professional closing statement (e.g., 'Deal closed. I agree to the final price.'). Do not provide any further negotiation logic.
 Keep your reasoning concise (1-2 sentences max).
 
 ${historyPrompt}`;
