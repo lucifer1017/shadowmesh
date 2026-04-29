@@ -17,12 +17,16 @@ interface DarkPoolState {
   history: MovePayload[];
 }
 
-interface AgentResponse {
-  status: string;
+type PoolStatus = "idle" | "negotiating" | "agreed" | "failed";
+
+interface AgreementData {
+  status: PoolStatus;
   agreedAmountWETH?: number;
   agreedAmountUSDC?: number;
   reasoning: string;
 }
+
+type AgentResponse = AgreementData;
 
 interface ParsedGenAIError {
   statusCode?: number;
@@ -200,6 +204,10 @@ function isFiniteNumber(value: unknown): value is number {
   return typeof value === "number" && Number.isFinite(value);
 }
 
+function isPoolStatus(value: unknown): value is PoolStatus {
+  return value === "idle" || value === "negotiating" || value === "agreed" || value === "failed";
+}
+
 function isMovePayload(value: unknown): value is MovePayload {
   return (
     isObject(value) &&
@@ -220,7 +228,7 @@ function isDarkPoolState(value: unknown): value is DarkPoolState {
 
 function isAgentResponse(value: unknown): value is AgentResponse {
   if (!isObject(value)) return false;
-  if (typeof value.status !== "string") return false;
+  if (!isPoolStatus(value.status)) return false;
   if (typeof value.reasoning !== "string") return false;
 
   if (
@@ -257,16 +265,22 @@ socket.on("disconnect", (reason: string) => {
 });
 
 socket.on("state_update", async (incoming: unknown) => {
+  if (isObject(incoming)) {
+    const maybeStatus = incoming.status;
+    const maybeTurn = incoming.turn;
+    if ((maybeStatus === "agreed" || maybeStatus === "failed") && typeof maybeTurn === "number") {
+      console.log(`✅ [STATE_LOCK]: Deal closed at Turn ${maybeTurn}. Disabling AI. Awaiting EIP-712 Signing...`);
+      lastCompletedTurn = Infinity;
+      return;
+    }
+  }
+
   if (!isDarkPoolState(incoming)) {
     console.error("Seller received malformed state_update payload.");
     return;
   }
 
   const state = incoming;
-
-  if (state.status === "agreed" || state.status === "failed") {
-    return;
-  }
 
   if (state.turn % 2 === 0) return;
   if (state.turn <= lastCompletedTurn) return;
@@ -288,7 +302,7 @@ Your minimum reserve price is 2,900 USDC per 1 WETH. DO NOT reveal this minimum 
 Negotiate aggressively for a higher price. Start high.
 While making counter-offers, you MUST set status to 'negotiating'.
 If the buyer refuses to pay at least 2,900 USDC per WETH, you must set status to 'failed'.
-If you reach a mutually beneficial agreement, set status to 'agreed' and output the final amounts.
+If you agree to the price, you MUST set status to 'agreed'. Your reasoning field MUST start exactly with: 'PROTOCOL_HANDSHAKE: DEAL_CLOSED.' followed by a one-sentence confirmation of the final price. Do not provide any further negotiation logic.
 Keep your reasoning concise (1-2 sentences max).
 
 ${historyPrompt}`;

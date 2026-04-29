@@ -17,12 +17,16 @@ interface DarkPoolState {
   history: MovePayload[];
 }
 
-interface AgentResponse {
-  status: string;
+type PoolStatus = "idle" | "negotiating" | "agreed" | "failed";
+
+interface AgreementData {
+  status: PoolStatus;
   agreedAmountWETH?: number;
   agreedAmountUSDC?: number;
   reasoning: string;
 }
+
+type AgentResponse = AgreementData;
 
 interface ParsedGenAIError {
   statusCode?: number;
@@ -195,6 +199,14 @@ function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
+function isFiniteNumber(value: unknown): value is number {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
+function isPoolStatus(value: unknown): value is PoolStatus {
+  return value === "idle" || value === "negotiating" || value === "agreed" || value === "failed";
+}
+
 function isMovePayload(value: unknown): value is MovePayload {
   return (
     isObject(value) &&
@@ -207,7 +219,7 @@ function isDarkPoolState(value: unknown): value is DarkPoolState {
   return (
     isObject(value) &&
     typeof value.status === "string" &&
-    typeof value.turn === "number" &&
+    isFiniteNumber(value.turn) &&
     Array.isArray(value.history) &&
     value.history.every(isMovePayload)
   );
@@ -215,20 +227,14 @@ function isDarkPoolState(value: unknown): value is DarkPoolState {
 
 function isAgentResponse(value: unknown): value is AgentResponse {
   if (!isObject(value)) return false;
-  if (typeof value.status !== "string") return false;
+  if (!isPoolStatus(value.status)) return false;
   if (typeof value.reasoning !== "string") return false;
 
-  if (
-    value.agreedAmountWETH !== undefined &&
-    typeof value.agreedAmountWETH !== "number"
-  ) {
+  if (value.agreedAmountWETH !== undefined && !isFiniteNumber(value.agreedAmountWETH)) {
     return false;
   }
 
-  if (
-    value.agreedAmountUSDC !== undefined &&
-    typeof value.agreedAmountUSDC !== "number"
-  ) {
+  if (value.agreedAmountUSDC !== undefined && !isFiniteNumber(value.agreedAmountUSDC)) {
     return false;
   }
 
@@ -252,16 +258,22 @@ socket.on("disconnect", (reason: string) => {
 });
 
 socket.on("state_update", async (incoming: unknown) => {
+  if (isObject(incoming)) {
+    const maybeStatus = incoming.status;
+    const maybeTurn = incoming.turn;
+    if ((maybeStatus === "agreed" || maybeStatus === "failed") && typeof maybeTurn === "number") {
+      console.log(`✅ [STATE_LOCK]: Deal closed at Turn ${maybeTurn}. Disabling AI. Awaiting EIP-712 Signing...`);
+      lastCompletedTurn = Infinity;
+      return;
+    }
+  }
+
   if (!isDarkPoolState(incoming)) {
     console.error("Buyer received malformed state_update payload.");
     return;
   }
 
   const state = incoming;
-
-  if (state.status === "agreed" || state.status === "failed") {
-    return;
-  }
 
   if (state.turn % 2 !== 0) return;
   if (state.turn <= lastCompletedTurn) return;
@@ -283,7 +295,7 @@ Your maximum limit price is 3,200 USDC per 1 WETH. DO NOT reveal this maximum li
 Negotiate aggressively for a lower price. Start low.
 While making counter-offers, you MUST set status to 'negotiating'.
 If the seller demands more than 3,200 USDC per WETH and refuses to budge, you must set status to 'failed'.
-If you reach a mutually beneficial agreement, set status to 'agreed' and output the final amounts.
+If you agree to the price, you MUST set status to 'agreed'. Your reasoning field MUST start exactly with: 'PROTOCOL_HANDSHAKE: DEAL_CLOSED.' followed by a one-sentence confirmation of the final price. Do not provide any further negotiation logic.
 Keep your reasoning concise (1-2 sentences max).
 
 ${historyPrompt}`;

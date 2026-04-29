@@ -107,17 +107,18 @@ io.on("connection", (socket: Socket) => {
   socket.emit("state_update", currentPoolState);
 
   socket.on("submit_move", (payload: unknown) => {
-    // 1. Intercept and log the raw payload so we can read the negotiation!
-    const logData = payload as { role?: string, message?: string, data?: any };
+    if (currentPoolState.status === "agreed" || currentPoolState.status === "failed") {
+      console.warn("⚠️ [SECURITY]: Move rejected. Pool is locked.");
+      return;
+    }
+
+    const logData = payload as { role?: string; message?: string; data?: unknown };
     console.log(`\n🗣️ [${(logData.role || "UNKNOWN").toUpperCase()}]: ${logData.message || "No message provided"}`);
 
-    // 2. Run the strict type guard and explicitly log if it fails
     if (!isMovePayload(payload)) {
       console.error("❌ BROKER DROPPED PAYLOAD (Failed Strict Type Guard):", payload);
       return;
     }
-
-    if (currentPoolState.status === "agreed" || currentPoolState.status === "failed") return;
 
     currentPoolState.history.push(payload);
     currentPoolState.turn += 1;
@@ -136,8 +137,19 @@ io.on("connection", (socket: Socket) => {
       return;
     }
 
-    if (payload.data && (payload.data.status === "agreed" || payload.data.status === "failed")) {
-      currentPoolState.status = payload.data.status;
+    if (payload.data?.status === "agreed") {
+      currentPoolState.status = "agreed";
+      currentPoolState.finalAgreement = payload.data;
+      console.log(
+        `\n🎉 [SETTLEMENT]: DEAL CLOSED | WETH: ${payload.data.agreedAmountWETH ?? "N/A"} | USDC: ${payload.data.agreedAmountUSDC ?? "N/A"}`
+      );
+      socket.broadcast.emit("negotiation_settled", currentPoolState.finalAgreement);
+      broadcastStateUpdate();
+      return;
+    }
+
+    if (payload.data?.status === "failed") {
+      currentPoolState.status = "failed";
       currentPoolState.finalAgreement = payload.data;
     }
 
