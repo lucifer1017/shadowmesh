@@ -107,7 +107,16 @@ io.on("connection", (socket: Socket) => {
   socket.emit("state_update", currentPoolState);
 
   socket.on("submit_move", (payload: unknown) => {
-    if (!isMovePayload(payload)) return;
+    // 1. Intercept and log the raw payload so we can read the negotiation!
+    const logData = payload as { role?: string, message?: string, data?: any };
+    console.log(`\n🗣️ [${(logData.role || "UNKNOWN").toUpperCase()}]: ${logData.message || "No message provided"}`);
+
+    // 2. Run the strict type guard and explicitly log if it fails
+    if (!isMovePayload(payload)) {
+      console.error("❌ BROKER DROPPED PAYLOAD (Failed Strict Type Guard):", payload);
+      return;
+    }
+
     if (currentPoolState.status === "agreed" || currentPoolState.status === "failed") return;
 
     currentPoolState.history.push(payload);

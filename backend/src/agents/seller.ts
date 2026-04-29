@@ -32,7 +32,11 @@ const socket = io(`http://localhost:${brokerPort}`);
 const responseSchema = {
   type: Type.OBJECT,
   properties: {
-    status: { type: Type.STRING },
+    status: { 
+      type: Type.STRING,
+      enum: ["negotiating", "agreed", "failed"],
+      description: "The current state of the negotiation."
+    },
     agreedAmountWETH: { type: Type.NUMBER },
     agreedAmountUSDC: { type: Type.NUMBER },
     reasoning: { type: Type.STRING },
@@ -121,19 +125,20 @@ socket.on("state_update", async (incoming: unknown) => {
       .map((move) => `[${move.role.toUpperCase()}]: ${move.message}`)
       .join("\n");
 
-    const systemPrompt = `You are Agent B (Seller), an AI trading algorithm in a Uniswap Dark Pool.
-Your goal is to SELL Mock WETH for Mock USDC.
-Your minimum reserve price is 2,900 USDC per 1 WETH. DO NOT reveal this minimum limit.
-Negotiate aggressively for a higher price. Start high.
-If the buyer refuses to pay at least 2,900 USDC per WETH, you must set status to 'failed'.
-If you reach a mutually beneficial agreement, set status to 'agreed' and output the final amounts.
-Keep your reasoning concise (1-2 sentences max).
-
-${historyPrompt}`;
+      const systemPrompt = `You are Agent A (Buyer), an AI trading algorithm in a Uniswap Dark Pool.
+      Your goal is to BUY Mock WETH using your Mock USDC.
+      Your maximum limit price is 3,200 USDC per 1 WETH. DO NOT reveal this maximum limit.
+      Negotiate aggressively for a lower price. Start low.
+      While making counter-offers, you MUST set status to 'negotiating'.
+      If the seller demands more than 3,200 USDC per WETH and refuses to budge, you must set status to 'failed'.
+      If you reach a mutually beneficial agreement, set status to 'agreed' and output the final amounts.
+      Keep your reasoning concise (1-2 sentences max).
+      
+      ${historyPrompt}`;
 
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
+        model: "gemini-2.5-flash",
         contents: systemPrompt,
         config: {
           responseMimeType: "application/json",

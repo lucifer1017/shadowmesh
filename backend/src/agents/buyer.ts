@@ -31,7 +31,11 @@ const socket = io(`http://localhost:${process.env.PORT || 5001}`);
 const responseSchema = {
   type: Type.OBJECT,
   properties: {
-    status: { type: Type.STRING },
+    status: { 
+      type: Type.STRING,
+      enum: ["negotiating", "agreed", "failed"],
+      description: "The current state of the negotiation."
+    },
     agreedAmountWETH: { type: Type.NUMBER },
     agreedAmountUSDC: { type: Type.NUMBER },
     reasoning: { type: Type.STRING },
@@ -128,7 +132,7 @@ ${historyPrompt}`;
 
     try {
       const response = await ai.models.generateContent({
-        model: "gemini-2.5-pro",
+        model: "gemini-2.5-flash",
         contents: systemPrompt,
         config: {
           responseMimeType: "application/json",
