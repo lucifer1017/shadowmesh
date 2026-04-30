@@ -5,9 +5,12 @@
   "main": "index.js",
   "scripts": {
     "test-ai": "tsx src/test.ts",
+    "gen:keys": "cd .. && openssl genpkey -algorithm ed25519 -out buyer-private.pem && openssl genpkey -algorithm ed25519 -out seller-private.pem",
+    "build:axl": "cd ../axl && go build -o node ./cmd/node/",
+    "dev:axl-buyer": "cd ../axl && ./node -config ../buyer-config.json",
+    "dev:axl-seller": "cd ../axl && ./node -config ../seller-config.json",
     "dev:buyer": "tsx watch src/agents/buyer.ts",
-    "dev:seller": "tsx watch src/agents/seller.ts",
-    "dev:broker": "tsx watch src/server.ts"
+    "dev:seller": "tsx watch src/agents/seller.ts"
   },
   "keywords": [],
   "author": "",

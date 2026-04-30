@@ -1,0 +1,7 @@
+# Gensyn AXL Infrastructure
+*.pem
+*-config.json
+axl/node
+axl/node.exe
+
+axl/
