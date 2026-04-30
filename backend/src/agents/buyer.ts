@@ -1,6 +1,8 @@
 import "dotenv/config";
-import { io } from "socket.io-client";
+import axios from "axios";
 import { GoogleGenAI, Type } from "@google/genai";
+import { parseUnits } from "viem";
+import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 if (!process.env.GEMINI_API_KEY) {
   throw new Error("Missing GEMINI_API_KEY in .env");
@@ -9,12 +11,7 @@ if (!process.env.GEMINI_API_KEY) {
 interface MovePayload {
   role: string;
   message: string;
-}
-
-interface DarkPoolState {
-  status: string;
-  turn: number;
-  history: MovePayload[];
+  data?: AgreementData;
 }
 
 type PoolStatus = "idle" | "negotiating" | "agreed" | "failed";
@@ -26,6 +23,13 @@ interface AgreementData {
   reasoning: string;
 }
 
+interface DarkPoolState {
+  status: string;
+  turn: number;
+  history: MovePayload[];
+  finalAgreement?: AgreementData | null;
+}
+
 type AgentResponse = AgreementData;
 
 interface ParsedGenAIError {
@@ -35,23 +39,68 @@ interface ParsedGenAIError {
 }
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
-const brokerPort = process.env.PORT || "5001";
-const socket = io(`http://localhost:${brokerPort}`, {
-  transports: ["websocket"],
-  reconnection: true,
-  reconnectionAttempts: Infinity,
-  reconnectionDelay: 500,
-  reconnectionDelayMax: 5_000,
+
+// ==========================================
+// GENSYN AXL: P2P Network Configuration
+// ==========================================
+const AXL_PORT = process.env.AXL_PORT || "9001";
+const TARGET_PUBKEY = process.env.TARGET_PUBKEY?.trim();
+
+if (!TARGET_PUBKEY) {
+  console.warn("⚠️ TARGET_PUBKEY is missing. AXL requires a peer public key to route messages.");
+}
+
+const AXL_BASE_URL = `http://127.0.0.1:${AXL_PORT}`;
+const axlHttp = axios.create({
+  baseURL: AXL_BASE_URL,
   timeout: 10_000,
+  validateStatus: (s) => (s >= 200 && s < 300) || s === 204 || s === 404,
 });
+
+let localPoolState: DarkPoolState = {
+  status: "idle",
+  turn: 0,
+  history: [],
+  finalAgreement: null,
+};
+
+function normalizePrivateKey(raw: string): `0x${string}` {
+  const normalized = raw.trim().replace(/^["']|["']$/g, "");
+  const hex = normalized.startsWith("0x") ? normalized.slice(2) : normalized;
+  if (!/^[a-fA-F0-9]{64}$/.test(hex)) {
+    throw new Error("Invalid private key format. Expected 64 hex chars (with or without 0x prefix).");
+  }
+  return `0x${hex}`;
+}
+
+const signerPrivateKey = process.env.AGENT_A_PRIVATE_KEY
+  ? normalizePrivateKey(process.env.AGENT_A_PRIVATE_KEY)
+  : process.env.PRIVATE_KEY
+    ? normalizePrivateKey(process.env.PRIVATE_KEY)
+    : generatePrivateKey();
+
+const account = privateKeyToAccount(signerPrivateKey);
+
+const EIP712_DOMAIN = {
+  name: "DarkPool",
+  version: "1",
+  chainId: 11155111,
+} as const;
+
+const EIP712_TYPES = {
+  Agreement: [
+    { name: "agreedAmountWETH", type: "uint256" },
+    { name: "agreedAmountUSDC", type: "uint256" },
+  ],
+} as const;
 
 const responseSchema = {
   type: Type.OBJECT,
   properties: {
-    status: { 
+    status: {
       type: Type.STRING,
       enum: ["negotiating", "agreed", "failed"],
-      description: "The current state of the negotiation."
+      description: "The current state of the negotiation.",
     },
     agreedAmountWETH: { type: Type.NUMBER },
     agreedAmountUSDC: { type: Type.NUMBER },
@@ -67,6 +116,8 @@ const GENERATION_TIMEOUT_MS = 30_000;
 
 let inFlightTurn: number | null = null;
 let lastCompletedTurn = -1;
+let hasSignedAgreement = false;
+let signingInProgress = false;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -156,6 +207,7 @@ function computeBackoffWithJitter(attempt: number, serverRetryMs?: number): numb
   const exponentialBase = BASE_BACKOFF_MS * (2 ** attempt);
   const delayWithJitter = exponentialBase + Math.floor(Math.random() * 1000);
   const cappedDelay = Math.min(MAX_BACKOFF_MS, delayWithJitter);
+
   if (typeof serverRetryMs === "number" && Number.isFinite(serverRetryMs)) {
     return Math.max(cappedDelay, serverRetryMs);
   }
@@ -241,29 +293,106 @@ function isAgentResponse(value: unknown): value is AgentResponse {
   return true;
 }
 
-console.log("🟢 Agent A (Buyer) Booting Up...");
+function parseAgreementAmountToBaseUnits(
+  value: number | string | undefined,
+  field: "agreedAmountWETH" | "agreedAmountUSDC"
+): bigint {
+  if (value === undefined) {
+    throw new Error(`Missing ${field}.`);
+  }
 
-socket.on("connect", () => {
-  console.log(`Agent A connected with socket ID: ${socket.id}`);
-  lastCompletedTurn = -1;
-  inFlightTurn = null;
-});
+  const normalized = typeof value === "number" ? value.toString() : value.trim();
+  if (!/^\d+(\.\d+)?$/.test(normalized)) {
+    throw new Error(`Invalid ${field}: expected a non-negative decimal amount.`);
+  }
 
-socket.on("connect_error", (error: Error) => {
-  console.error("Buyer socket connection error:", error.message);
-});
+  return parseUnits(normalized, 18);
+}
 
-socket.on("disconnect", (reason: string) => {
-  console.log(`Buyer disconnected: ${reason}`);
-});
+function extractFinalAgreementFromIncoming(incoming: unknown): AgreementData | null {
+  if (!isObject(incoming)) return null;
+  const candidate = incoming.finalAgreement;
+  if (candidate === null || candidate === undefined) return null;
+  if (!isAgentResponse(candidate)) return null;
+  return candidate;
+}
 
-socket.on("state_update", async (incoming: unknown) => {
+async function signFinalAgreementIfNeeded(incoming: unknown): Promise<void> {
+  if (hasSignedAgreement || signingInProgress) return;
+
+  const finalAgreement = extractFinalAgreementFromIncoming(incoming);
+  if (!finalAgreement || finalAgreement.status !== "agreed") return;
+
+  signingInProgress = true;
+  try {
+    const agreedAmountWETH = parseAgreementAmountToBaseUnits(
+      finalAgreement.agreedAmountWETH,
+      "agreedAmountWETH"
+    );
+    const agreedAmountUSDC = parseAgreementAmountToBaseUnits(
+      finalAgreement.agreedAmountUSDC,
+      "agreedAmountUSDC"
+    );
+
+    const signature = await account.signTypedData({
+      domain: EIP712_DOMAIN,
+      types: EIP712_TYPES,
+      primaryType: "Agreement",
+      message: {
+        agreedAmountWETH,
+        agreedAmountUSDC,
+      },
+    });
+
+    hasSignedAgreement = true;
+    console.log(`✍️ [WEB3 SIGNATURE]: ${signature}`);
+  } catch (error: unknown) {
+    console.error("Buyer EIP-712 signing error:", error);
+  } finally {
+    signingInProgress = false;
+  }
+}
+
+function safeJsonParse<T>(value: unknown): T | null {
+  if (typeof value !== "string") return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+}
+
+function isNewerState(state: DarkPoolState): boolean {
+  return state.turn > localPoolState.turn;
+}
+
+async function sendToPeer(payload: DarkPoolState) {
+  if (!TARGET_PUBKEY) return;
+  try {
+    await axlHttp.post("/send", JSON.stringify(payload), {
+      headers: {
+        "Content-Type": "application/json",
+        "X-Destination-Peer-Id": TARGET_PUBKEY,
+      },
+    });
+  } catch (error) {
+    console.error("❌ AXL Send Error:", error);
+  }
+}
+
+async function processStateUpdate(incoming: unknown) {
   if (isObject(incoming)) {
     const maybeStatus = incoming.status;
     const maybeTurn = incoming.turn;
     if ((maybeStatus === "agreed" || maybeStatus === "failed") && typeof maybeTurn === "number") {
       console.log(`✅ [STATE_LOCK]: Deal closed at Turn ${maybeTurn}. Disabling AI. Awaiting EIP-712 Signing...`);
       lastCompletedTurn = Infinity;
+      localPoolState.status = maybeStatus;
+      localPoolState.turn = maybeTurn;
+
+      if (maybeStatus === "agreed") {
+        await signFinalAgreementIfNeeded(incoming);
+      }
       return;
     }
   }
@@ -308,16 +437,85 @@ ${historyPrompt}`;
       return;
     }
 
-    socket.emit("submit_move", {
+    const newPayload: MovePayload & { data: AgentResponse } = {
       role: "buyer",
       message: parsedUnknown.reasoning,
       data: parsedUnknown,
-    });
+    };
 
+    if (localPoolState.status === "agreed" || localPoolState.status === "failed") {
+      lastCompletedTurn = Infinity;
+      return;
+    }
+
+    localPoolState.history.push(newPayload);
+    localPoolState.turn += 1;
+    localPoolState.status = parsedUnknown.status;
+    if (parsedUnknown.status === "agreed" || parsedUnknown.status === "failed") {
+      localPoolState.finalAgreement = parsedUnknown;
+    }
+
+    await sendToPeer(localPoolState);
     lastCompletedTurn = state.turn;
   } catch (error: unknown) {
     console.error("Buyer AI Generation Error:", error);
   } finally {
     if (inFlightTurn === state.turn) inFlightTurn = null;
   }
-});
+}
+
+async function pollIncomingMessages() {
+  if (lastCompletedTurn === Infinity) return;
+
+  try {
+    const response = await axlHttp.get("/recv", { responseType: "text" });
+    if (response.status === 204 || response.status === 404) return;
+
+    const raw = typeof response.data === "string" ? response.data : JSON.stringify(response.data);
+    const incomingState = safeJsonParse<DarkPoolState>(raw);
+    if (!incomingState) return;
+    if (!isDarkPoolState(incomingState)) return;
+    if (!isNewerState(incomingState)) return;
+
+    localPoolState = incomingState;
+    await processStateUpdate(localPoolState);
+  } catch {
+    // ignore transient empty-queue/timeouts
+  }
+}
+
+console.log("🟢 Agent A (Buyer) Booting Up...");
+console.log(`🧾 Agent A wallet: ${account.address}`);
+
+let pollLoopStarted = false;
+let pollInFlight = false;
+
+function startPolling() {
+  if (pollLoopStarted) return;
+  pollLoopStarted = true;
+
+  const loop = async () => {
+    if (!pollInFlight) {
+      pollInFlight = true;
+      try {
+        await pollIncomingMessages();
+      } finally {
+        pollInFlight = false;
+      }
+    }
+    setTimeout(loop, 2000);
+  };
+
+  void loop();
+}
+
+startPolling();
+
+// BOOTSTRAP THE MESH: Buyer makes the first move
+setTimeout(() => {
+  if (localPoolState.turn === 0) {
+    console.log("🚀 Bootstrapping P2P Negotiation...");
+    // Manually trigger the first state evaluation
+    void processStateUpdate(localPoolState);
+  }
+}, 3000);
