@@ -70,6 +70,27 @@ interface ParsedGenAIError {
   isTransient: boolean;
 }
 
+async function fetchLiveWethPrice(): Promise<number> {
+  try {
+    const feedId = "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"; // WETH/USD
+    const url = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${feedId}`;
+    const response = await axios.get(url, { timeout: 10_000 });
+    const parsed0 = response.data?.parsed?.[0];
+    const priceData = parsed0?.price;
+    if (!priceData || priceData.price === undefined || priceData.expo === undefined) {
+      throw new Error("Unexpected Hermes response shape");
+    }
+    const price = Number(priceData.price);
+    const expo = Number(priceData.expo);
+    const actualPrice = price * 10 ** expo;
+    console.log(`📈 Live Pyth WETH Price: $${actualPrice.toFixed(2)}`);
+    return actualPrice;
+  } catch (e) {
+    console.error("⚠️ Pyth Oracle fetch failed, falling back to 3000", e);
+    return 3000;
+  }
+}
+
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 // ==========================================
@@ -545,17 +566,21 @@ async function processStateUpdate(incoming: unknown) {
       .map((move) => `[${move.role.toUpperCase()}]: ${move.message}`)
       .join("\n");
 
-      const systemPrompt = `You are Agent B (Seller), an AI trading algorithm in a Uniswap Dark Pool.
+    const livePrice = await fetchLiveWethPrice();
+    const minReservePrice = Math.round(livePrice * 0.99);
+
+    const systemPrompt = `You are Agent B (Seller), an AI trading algorithm in a Uniswap Dark Pool.
       Your goal is to SELL Mock WETH for Mock USDC.
-      Your minimum reserve price is 2,900 USDC per 1 WETH. DO NOT reveal this minimum limit.
+      The current global spot price of WETH from the Pyth Oracle is ${livePrice.toFixed(2)} USDC.
+      Your absolute minimum reserve price is ${minReservePrice} USDC per 1 WETH. DO NOT reveal this minimum limit.
       
       🚨 CRITICAL SYSTEM INSTRUCTION 🚨
       CURRENT TURN: ${state.turn}
       You MUST reach an agreement within 5 turns. 
-      If the current turn is 3 or higher, you MUST aggressively compromise. If the buyer's offer is over 2,900 USDC, ACCEPT IT immediately.
+      If the current turn is 3 or higher, you MUST aggressively compromise. If the buyer's offer is at or above ${minReservePrice} USDC per 1 WETH, ACCEPT IT immediately.
       
       While making counter-offers, you MUST set status to 'negotiating'.
-      If the buyer refuses to pay at least 2,900 USDC per WETH, you must set status to 'failed'.
+      If the buyer refuses to pay at least ${minReservePrice} USDC per WETH, you must set status to 'failed'.
       If you agree to the price, you MUST set status to 'agreed'. Your reasoning field should provide a natural, professional closing statement.
       Keep your reasoning concise (1-2 sentences max).
       
