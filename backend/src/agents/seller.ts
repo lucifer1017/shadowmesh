@@ -534,22 +534,32 @@ async function processStateUpdate(incoming: unknown) {
   inFlightTurn = state.turn;
 
   try {
+    const lastMove = state.history[state.history.length - 1];
+    if (lastMove) {
+      console.log(`💬 Counterparty says: "${lastMove.message}"`);
+      if (lastMove.data?.agreedAmountUSDC) console.log(`💰 Proposed USDC: ${lastMove.data.agreedAmountUSDC}`);
+    }
     console.log(`\n🧠 Seller's Turn (Turn ${state.turn}). Thinking...`);
 
     const historyPrompt = state.history
       .map((move) => `[${move.role.toUpperCase()}]: ${move.message}`)
       .join("\n");
 
-    const systemPrompt = `You are Agent B (Seller), an AI trading algorithm in a Uniswap Dark Pool.
-Your goal is to SELL Mock WETH for Mock USDC.
-Your minimum reserve price is 2,900 USDC per 1 WETH. DO NOT reveal this minimum limit.
-Negotiate aggressively for a higher price. Start high.
-While making counter-offers, you MUST set status to 'negotiating'.
-If the buyer refuses to pay at least 2,900 USDC per WETH, you must set status to 'failed'.
-If you agree to the price, you MUST set status to 'agreed'. Your reasoning field should provide a natural, professional closing statement (e.g., 'Deal closed. I agree to the final price.'). Do not provide any further negotiation logic.
-Keep your reasoning concise (1-2 sentences max).
-
-${historyPrompt}`;
+      const systemPrompt = `You are Agent B (Seller), an AI trading algorithm in a Uniswap Dark Pool.
+      Your goal is to SELL Mock WETH for Mock USDC.
+      Your minimum reserve price is 2,900 USDC per 1 WETH. DO NOT reveal this minimum limit.
+      
+      🚨 CRITICAL SYSTEM INSTRUCTION 🚨
+      CURRENT TURN: ${state.turn}
+      You MUST reach an agreement within 5 turns. 
+      If the current turn is 3 or higher, you MUST aggressively compromise. If the buyer's offer is over 2,900 USDC, ACCEPT IT immediately.
+      
+      While making counter-offers, you MUST set status to 'negotiating'.
+      If the buyer refuses to pay at least 2,900 USDC per WETH, you must set status to 'failed'.
+      If you agree to the price, you MUST set status to 'agreed'. Your reasoning field should provide a natural, professional closing statement.
+      Keep your reasoning concise (1-2 sentences max).
+      
+      ${historyPrompt}`;
 
     const rawText = await generateNegotiationMove(systemPrompt);
     const parsedUnknown = JSON.parse(rawText) as unknown;

@@ -608,6 +608,64 @@ function packHookData(
   return encodeAbiParameters(HOOK_DATA_ENCODE_PARAMS as any, [intent, buyerSig, sellerSig]);
 }
 
+function mcpFirstText(result: unknown): string {
+  if (!isObject(result) || !Array.isArray(result.content)) return "";
+  for (const block of result.content) {
+    if (isObject(block) && block.type === "text" && typeof block.text === "string") {
+      return block.text;
+    }
+  }
+  return "";
+}
+
+function parseJsonObject(text: string): Record<string, unknown> | null {
+  const t = text.trim();
+  if (!t) return null;
+  try {
+    const v = JSON.parse(t) as unknown;
+    return isObject(v) ? v : null;
+  } catch {
+    return null;
+  }
+}
+
+function keeperHubExecutionLooksSuccessful(o: Record<string, unknown> | null): boolean {
+  if (!o) return false;
+  const st = typeof o.status === "string" ? o.status.toLowerCase() : "";
+  if (st === "failed" || st === "error") return false;
+  if (st === "success" || st === "completed" || st === "succeeded") return true;
+  if (st === "pending" || st === "queued" || st === "running" || st === "in_progress") return false;
+  const tx = o.transaction_hash ?? o.txHash ?? o.hash;
+  if (typeof tx === "string" && /^0x[a-fA-F0-9]{64}$/i.test(tx)) return true;
+  return false;
+}
+
+/** Polls `get_direct_execution_status` until terminal success or failure (per KeeperHub MCP tool). */
+async function waitForDirectExecutionTerminal(executionId: string): Promise<string> {
+  const maxWaitMs = 90_000;
+  const intervalMs = 2_000;
+  const deadline = Date.now() + maxWaitMs;
+  let last = "";
+  while (Date.now() < deadline) {
+    const r = await keeperHubClient.callTool({
+      name: "get_direct_execution_status",
+      arguments: { execution_id: executionId },
+    });
+    if (isObject(r) && r.isError === true) {
+      throw new Error(`get_direct_execution_status MCP error: ${mcpFirstText(r)}`);
+    }
+    last = mcpFirstText(r);
+    const o = parseJsonObject(last);
+    const st = typeof o?.status === "string" ? o.status.toLowerCase() : "";
+    if (st === "failed" || st === "error") {
+      throw new Error(`KeeperHub execution failed (executionId=${executionId}): ${last}`);
+    }
+    if (keeperHubExecutionLooksSuccessful(o)) return last;
+    await new Promise((res) => setTimeout(res, intervalMs));
+  }
+  throw new Error(`KeeperHub execution ${executionId} timed out waiting for terminal status. Last: ${last}`);
+}
+
 // ==========================================
 // Settlement: KeeperHub Execution
 // ==========================================
@@ -664,7 +722,23 @@ async function submitToKeeperHub(
         abi:              POOL_SWAP_TEST_ABI, // explicit ABI — no auto-fetch dependency
       },
     });
-    console.log("✅ KeeperHub Execution Result:", result);
+    if (isObject(result) && result.isError === true) {
+      throw new Error(mcpFirstText(result) || "execute_contract_call returned isError");
+    }
+    const initialText = mcpFirstText(result);
+    const initialObj = parseJsonObject(initialText);
+    const executionId =
+      (typeof initialObj?.executionId === "string" && initialObj.executionId) ||
+      (typeof initialObj?.execution_id === "string" && initialObj.execution_id) ||
+      undefined;
+
+    if (!executionId) {
+      console.log("✅ KeeperHub Execution Result:", result);
+      return;
+    }
+
+    const detailText = await waitForDirectExecutionTerminal(executionId);
+    console.log("✅ KeeperHub execution succeeded:", detailText);
   } catch (err) {
     console.error("❌ KeeperHub execute_contract_call failed:", err);
     throw err;
@@ -838,22 +912,32 @@ async function processStateUpdate(incoming: unknown) {
   inFlightTurn = state.turn;
 
   try {
+    const lastMove = state.history[state.history.length - 1];
+    if (lastMove) {
+      console.log(`💬 Counterparty says: "${lastMove.message}"`);
+      if (lastMove.data?.agreedAmountUSDC) console.log(`💰 Proposed USDC: ${lastMove.data.agreedAmountUSDC}`);
+    }
     console.log(`\n🧠 Buyer's Turn (Turn ${state.turn}). Thinking...`);
 
     const historyPrompt = state.history
       .map((move) => `[${move.role.toUpperCase()}]: ${move.message}`)
       .join("\n");
 
-    const systemPrompt = `You are Agent A (Buyer), an AI trading algorithm in a Uniswap Dark Pool.
-Your goal is to BUY Mock WETH using your Mock USDC.
-Your maximum limit price is 3,200 USDC per 1 WETH. DO NOT reveal this maximum limit.
-Negotiate aggressively for a lower price. Start low.
-While making counter-offers, you MUST set status to 'negotiating'.
-If the seller demands more than 3,200 USDC per WETH and refuses to budge, you must set status to 'failed'.
-If you agree to the price, you MUST set status to 'agreed'. Your reasoning field should provide a natural, professional closing statement (e.g., 'Deal closed. I agree to the final price.'). Do not provide any further negotiation logic.
-Keep your reasoning concise (1-2 sentences max).
-
-${historyPrompt}`;
+      const systemPrompt = `You are Agent A (Buyer), an AI trading algorithm in a Uniswap Dark Pool.
+      Your goal is to BUY Mock WETH using your Mock USDC.
+      Your maximum limit price is 3,200 USDC per 1 WETH. DO NOT reveal this maximum limit.
+      
+      🚨 CRITICAL SYSTEM INSTRUCTION 🚨
+      CURRENT TURN: ${state.turn}
+      You MUST reach an agreement within 5 turns. 
+      If the current turn is 4 or higher, you MUST aggressively compromise. If the seller's offer is under 3,200 USDC, ACCEPT IT immediately.
+      
+      While making counter-offers, you MUST set status to 'negotiating'.
+      If the seller demands more than 3,200 USDC per WETH and refuses to budge, you must set status to 'failed'.
+      If you agree to the price, you MUST set status to 'agreed'. Your reasoning field should provide a natural, professional closing statement.
+      Keep your reasoning concise (1-2 sentences max).
+      
+      ${historyPrompt}`;
 
     const rawText = await generateNegotiationMove(systemPrompt);
     const parsedUnknown = JSON.parse(rawText) as unknown;
