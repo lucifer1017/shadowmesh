@@ -1,7 +1,10 @@
 import "dotenv/config";
 import axios from "axios";
 import { GoogleGenAI, Type } from "@google/genai";
-import { parseUnits } from "viem";
+import { Client } from "@modelcontextprotocol/sdk/client";
+import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp";
+import { parseUnits, encodeAbiParameters, createPublicClient, http, type Hex } from "viem";
+import { sepolia } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 if (!process.env.GEMINI_API_KEY) {
@@ -28,6 +31,40 @@ interface DarkPoolState {
   turn: number;
   history: MovePayload[];
   finalAgreement?: AgreementData | null;
+  /** Wire-format intent (bigint fields as decimal strings) — safe for JSON.stringify over AXL */
+  intent?: WireDarkPoolIntent;
+  buyerSettlementSig?: string;
+  sellerSettlementSig?: string;
+}
+
+/** JSON-safe mirror of DarkPoolIntentArg for mesh transport (no bigint) */
+interface WireDarkPoolIntent {
+  tokenIn:     `0x${string}`;
+  tokenOut:    `0x${string}`;
+  fee:         number;
+  tickSpacing: number;
+  amountIn:    string;
+  amountOut:   string;
+  buyer:       `0x${string}`;
+  seller:      `0x${string}`;
+  buyerNonce:  string;
+  sellerNonce: string;
+  deadline:    string;
+}
+
+// On-chain DarkPoolIntent struct (must match ShadowMeshHook.sol field order exactly)
+interface DarkPoolIntentArg {
+  tokenIn:     `0x${string}`;
+  tokenOut:    `0x${string}`;
+  fee:         number;   // uint24 — viem accepts JS number for sub-32-bit ints
+  tickSpacing: number;   // int24
+  amountIn:    bigint;
+  amountOut:   bigint;
+  buyer:       `0x${string}`;
+  seller:      `0x${string}`;
+  buyerNonce:  bigint;
+  sellerNonce: bigint;
+  deadline:    bigint;
 }
 
 type AgentResponse = AgreementData;
@@ -39,6 +76,10 @@ interface ParsedGenAIError {
 }
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+const keeperHubClient = new Client(
+  { name: "shadowmesh-buyer", version: "1.0.0" },
+  { capabilities: {} }
+);
 
 // ==========================================
 // GENSYN AXL: P2P Network Configuration
@@ -81,18 +122,125 @@ const signerPrivateKey = process.env.AGENT_A_PRIVATE_KEY
 
 const account = privateKeyToAccount(signerPrivateKey);
 
-const EIP712_DOMAIN = {
-  name: "DarkPool",
+// ==========================================
+// Settlement: EIP-712 Domain & Types
+// Matches ShadowMeshHook: EIP712("ShadowMesh", "1") + OZ address(this) in digest
+// ==========================================
+const HOOK_ADDRESS = "0xb76306D31e12336F0D8C62497190ae49f06Bc080" as const;
+
+const SETTLEMENT_DOMAIN = {
+  name: "ShadowMesh",
   version: "1",
   chainId: 11155111,
+  verifyingContract: HOOK_ADDRESS, // OZ EIP712 includes contract address in domain separator
 } as const;
 
-const EIP712_TYPES = {
-  Agreement: [
-    { name: "agreedAmountWETH", type: "uint256" },
-    { name: "agreedAmountUSDC", type: "uint256" },
+const DARK_POOL_INTENT_TYPES = {
+  DarkPoolIntent: [
+    { name: "tokenIn",     type: "address" },
+    { name: "tokenOut",    type: "address" },
+    { name: "fee",         type: "uint24"  },
+    { name: "tickSpacing", type: "int24"   },
+    { name: "amountIn",    type: "uint256" },
+    { name: "amountOut",   type: "uint256" },
+    { name: "buyer",       type: "address" },
+    { name: "seller",      type: "address" },
+    { name: "buyerNonce",  type: "uint256" },
+    { name: "sellerNonce", type: "uint256" },
+    { name: "deadline",    type: "uint256" },
   ],
 } as const;
+
+// ==========================================
+// Uniswap v4: Price Limits & ABIs
+// ==========================================
+
+// TickMath.MIN_SQRT_PRICE + 1 and MAX_SQRT_PRICE - 1 (prevent out-of-range revert)
+const MIN_PRICE_LIMIT = 4295128740n;
+const MAX_PRICE_LIMIT = 1461446703485210103287273052203988822378723970341n;
+
+// Minimal inline ABI — only the nonces(address) read function is needed
+const NONCES_ABI = [
+  {
+    name: "nonces",
+    type: "function",
+    stateMutability: "view",
+    inputs:  [{ name: "owner", type: "address" }],
+    outputs: [{ name: "",      type: "uint256" }],
+  },
+] as const;
+
+// Explicit PoolSwapTest ABI passed to KeeperHub — avoids relying on auto-fetch from
+// block explorer (test helper contracts may not be verified).
+const POOL_SWAP_TEST_ABI = JSON.stringify([
+  {
+    name: "swap",
+    type: "function",
+    stateMutability: "payable",
+    inputs: [
+      {
+        name: "key",
+        type: "tuple",
+        components: [
+          { name: "currency0",   type: "address" },
+          { name: "currency1",   type: "address" },
+          { name: "fee",         type: "uint24"  },
+          { name: "tickSpacing", type: "int24"   },
+          { name: "hooks",       type: "address" },
+        ],
+      },
+      {
+        name: "params",
+        type: "tuple",
+        components: [
+          { name: "zeroForOne",        type: "bool"    },
+          { name: "amountSpecified",   type: "int256"  },
+          { name: "sqrtPriceLimitX96", type: "uint160" },
+        ],
+      },
+      {
+        name: "testSettings",
+        type: "tuple",
+        components: [
+          { name: "takeClaims",      type: "bool" },
+          { name: "settleUsingBurn", type: "bool" },
+        ],
+      },
+      { name: "hookData", type: "bytes" },
+    ],
+    outputs: [{ name: "delta", type: "int256" }],
+  },
+]);
+
+// Typed params for encodeAbiParameters — mirrors DarkPoolIntent struct field order
+const HOOK_DATA_ENCODE_PARAMS = [
+  {
+    type: "tuple",
+    components: [
+      { name: "tokenIn",     type: "address" },
+      { name: "tokenOut",    type: "address" },
+      { name: "fee",         type: "uint24"  },
+      { name: "tickSpacing", type: "int24"   },
+      { name: "amountIn",    type: "uint256" },
+      { name: "amountOut",   type: "uint256" },
+      { name: "buyer",       type: "address" },
+      { name: "seller",      type: "address" },
+      { name: "buyerNonce",  type: "uint256" },
+      { name: "sellerNonce", type: "uint256" },
+      { name: "deadline",    type: "uint256" },
+    ],
+  },
+  { type: "bytes" },
+  { type: "bytes" },
+] as const;
+
+// ==========================================
+// Viem Public Client — Sepolia on-chain reads
+// ==========================================
+const publicClient = createPublicClient({
+  chain: sepolia,
+  transport: http(process.env.SEPOLIA_RPC_URL ?? "https://rpc.sepolia.org"),
+});
 
 const responseSchema = {
   type: Type.OBJECT,
@@ -116,8 +264,11 @@ const GENERATION_TIMEOUT_MS = 30_000;
 
 let inFlightTurn: number | null = null;
 let lastCompletedTurn = -1;
-let hasSignedAgreement = false;
 let signingInProgress = false;
+let hasSubmittedSettlement = false;
+/** Heartbeat re-broadcast of Phase 1 if AXL send was lost (sendToPeer swallows errors) */
+const SETTLEMENT_REBROADCAST_INTERVAL_MS = 10_000;
+let lastSettlementBroadcastAt = 0;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -317,37 +468,308 @@ function extractFinalAgreementFromIncoming(incoming: unknown): AgreementData | n
   return candidate;
 }
 
-async function signFinalAgreementIfNeeded(incoming: unknown): Promise<void> {
-  if (hasSignedAgreement || signingInProgress) return;
+// ==========================================
+// Settlement: Nonce Fetch
+// ==========================================
 
-  const finalAgreement = extractFinalAgreementFromIncoming(incoming);
+/**
+ * Fetches the live on-chain nonces for buyer and seller from ShadowMeshHook.
+ * Must be called before building the DarkPoolIntent — _useCheckedNonce() will
+ * revert with InvalidAccountNonce if the value in the intent doesn't match.
+ */
+async function fetchNonces(
+  buyer: `0x${string}`,
+  seller: `0x${string}`,
+): Promise<{ buyerNonce: bigint; sellerNonce: bigint }> {
+  const [buyerNonce, sellerNonce] = await Promise.all([
+    publicClient.readContract({
+      address: HOOK_ADDRESS,
+      abi: NONCES_ABI,
+      functionName: "nonces",
+      args: [buyer],
+    }),
+    publicClient.readContract({
+      address: HOOK_ADDRESS,
+      abi: NONCES_ABI,
+      functionName: "nonces",
+      args: [seller],
+    }),
+  ]);
+  console.log(`🔢 On-chain nonces — Buyer: ${buyerNonce}, Seller: ${sellerNonce}`);
+  return { buyerNonce, sellerNonce };
+}
+
+// ==========================================
+// Settlement: Intent Construction & Signing
+// ==========================================
+
+function buildDarkPoolIntent(
+  finalAgreement: AgreementData,
+  buyerNonce: bigint,
+  sellerNonce: bigint,
+): DarkPoolIntentArg {
+  const tokenIn        = process.env.TOKEN_IN?.trim() as `0x${string}` | undefined;
+  const tokenOut       = process.env.TOKEN_OUT?.trim() as `0x${string}` | undefined;
+  const sellerAddress  = process.env.SELLER_ADDRESS?.trim() as `0x${string}` | undefined;
+  const poolFee        = process.env.POOL_FEE ? parseInt(process.env.POOL_FEE, 10) : undefined;
+  const poolTickSpacing = process.env.POOL_TICK_SPACING
+    ? parseInt(process.env.POOL_TICK_SPACING, 10)
+    : undefined;
+
+  if (!tokenIn || !tokenOut || !sellerAddress || poolFee === undefined || poolTickSpacing === undefined) {
+    throw new Error(
+      "Missing env vars required for settlement: TOKEN_IN, TOKEN_OUT, SELLER_ADDRESS, POOL_FEE, POOL_TICK_SPACING"
+    );
+  }
+
+  // Buyer pays amountIn (USDC), receives amountOut (WETH)
+  const amountIn  = parseAgreementAmountToBaseUnits(finalAgreement.agreedAmountUSDC, "agreedAmountUSDC");
+  const amountOut = parseAgreementAmountToBaseUnits(finalAgreement.agreedAmountWETH, "agreedAmountWETH");
+
+  return {
+    tokenIn,
+    tokenOut,
+    fee: poolFee,
+    tickSpacing: poolTickSpacing,
+    amountIn,
+    amountOut,
+    buyer:       account.address,
+    seller:      sellerAddress,
+    buyerNonce,
+    sellerNonce,
+    deadline: BigInt(Math.floor(Date.now() / 1000) + 300), // 5-minute window
+  };
+}
+
+async function signDarkPoolIntent(intent: DarkPoolIntentArg): Promise<`0x${string}`> {
+  return account.signTypedData({
+    domain: SETTLEMENT_DOMAIN,
+    types:  DARK_POOL_INTENT_TYPES,
+    primaryType: "DarkPoolIntent",
+    message: intent,
+  });
+}
+
+function toWireIntent(i: DarkPoolIntentArg): WireDarkPoolIntent {
+  return {
+    tokenIn: i.tokenIn,
+    tokenOut: i.tokenOut,
+    fee: i.fee,
+    tickSpacing: i.tickSpacing,
+    amountIn: i.amountIn.toString(),
+    amountOut: i.amountOut.toString(),
+    buyer: i.buyer,
+    seller: i.seller,
+    buyerNonce: i.buyerNonce.toString(),
+    sellerNonce: i.sellerNonce.toString(),
+    deadline: i.deadline.toString(),
+  };
+}
+
+function fromWireIntent(w: WireDarkPoolIntent): DarkPoolIntentArg | null {
+  try {
+    return {
+      tokenIn: w.tokenIn,
+      tokenOut: w.tokenOut,
+      fee: w.fee,
+      tickSpacing: w.tickSpacing,
+      amountIn: BigInt(w.amountIn),
+      amountOut: BigInt(w.amountOut),
+      buyer: w.buyer,
+      seller: w.seller,
+      buyerNonce: BigInt(w.buyerNonce),
+      sellerNonce: BigInt(w.sellerNonce),
+      deadline: BigInt(w.deadline),
+    };
+  } catch {
+    return null;
+  }
+}
+
+// ==========================================
+// Settlement: hookData Packing
+// ==========================================
+
+/** JSON replacer to serialise BigInt as decimal strings for KeeperHub function_args. */
+function bigintReplacer(_key: string, value: unknown): unknown {
+  return typeof value === "bigint" ? value.toString() : value;
+}
+
+/**
+ * Packs (DarkPoolIntent, buyerSig, sellerSig) into a single ABI-encoded bytes blob.
+ * Matches the abi.decode(hookData, (DarkPoolIntent, bytes, bytes)) in _beforeSwap.
+ */
+function packHookData(
+  intent: DarkPoolIntentArg,
+  buyerSig: `0x${string}`,
+  sellerSig: `0x${string}`,
+): Hex {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  return encodeAbiParameters(HOOK_DATA_ENCODE_PARAMS as any, [intent, buyerSig, sellerSig]);
+}
+
+// ==========================================
+// Settlement: KeeperHub Execution
+// ==========================================
+
+async function submitToKeeperHub(
+  intent: DarkPoolIntentArg,
+  buyerSig: `0x${string}`,
+  sellerSig: `0x${string}`,
+): Promise<void> {
+  const router = process.env.ROUTER_ADDRESS?.trim();
+  if (!router) throw new Error("Missing ROUTER_ADDRESS in .env.buyer");
+
+  const hookData = packHookData(intent, buyerSig, sellerSig);
+
+  // Uniswap v4 requires currency0 < currency1 by address (ascending sort)
+  const [currency0, currency1] =
+    intent.tokenIn.toLowerCase() < intent.tokenOut.toLowerCase()
+      ? [intent.tokenIn, intent.tokenOut]
+      : [intent.tokenOut, intent.tokenIn];
+
+  const zeroForOne = intent.tokenIn.toLowerCase() === currency0.toLowerCase();
+
+  const poolKey = {
+    currency0,
+    currency1,
+    fee:         intent.fee,
+    tickSpacing: intent.tickSpacing,
+    hooks:       HOOK_ADDRESS, // must match address(this) check in _validateIntentForSwap
+  };
+
+  const swapParams = {
+    zeroForOne,
+    // Negative amountSpecified = exact-input swap; magnitude must equal intent.amountIn
+    amountSpecified: (-intent.amountIn).toString(),
+    // Use canonical price limits to avoid TickMath out-of-range revert
+    sqrtPriceLimitX96: (zeroForOne ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT).toString(),
+  };
+
+  const testSettings = { takeClaims: false, settleUsingBurn: false };
+
+  const functionArgs = JSON.stringify(
+    [poolKey, swapParams, testSettings, hookData],
+    bigintReplacer, // prevents JSON.stringify TypeError on BigInt fields
+  );
+
+  try {
+    const result = await keeperHubClient.callTool({
+      name: "execute_contract_call",
+      arguments: {
+        contract_address: router,
+        network:          "11155111", // Sepolia chain ID string (canonical KeeperHub format)
+        function_name:    "swap",
+        function_args:    functionArgs,
+        abi:              POOL_SWAP_TEST_ABI, // explicit ABI — no auto-fetch dependency
+      },
+    });
+    console.log("✅ KeeperHub Execution Result:", result);
+  } catch (err) {
+    console.error("❌ KeeperHub execute_contract_call failed:", err);
+    throw err;
+  }
+}
+
+// ==========================================
+// Settlement: State-Lock Handler
+// ==========================================
+
+/**
+ * Two-phase settlement (deadlock-free):
+ * Phase 1 — If agreed and no buyerSettlementSig yet: fetch nonces, build+sign intent,
+ *   store WireDarkPoolIntent + buyerSettlementSig on localPoolState, sendToPeer.
+ * Phase 2 — If sellerSettlementSig on incoming and local wire intent + buyer sig exist:
+ *   reconstruct bigint intent, submitToKeeperHub (sets hasSubmittedSettlement only on success).
+ * Heartbeat — If Phase 1 done but no submission yet, re-broadcast every SETTLEMENT_REBROADCAST_INTERVAL_MS.
+ */
+async function handleSettlement(incoming: unknown): Promise<void> {
+  if (hasSubmittedSettlement) return;
+
+  // ── Phase 2: seller signature arrived ─────────────────────────────────────
+  const incomingSellerSig =
+    isObject(incoming) &&
+    typeof incoming.sellerSettlementSig === "string" &&
+    incoming.sellerSettlementSig.startsWith("0x")
+      ? (incoming.sellerSettlementSig as `0x${string}`)
+      : null;
+
+  if (incomingSellerSig && localPoolState.buyerSettlementSig && localPoolState.intent) {
+    const intent = fromWireIntent(localPoolState.intent);
+    if (!intent) {
+      console.error("Settlement Phase 2: cannot reconstruct intent from wire");
+      return;
+    }
+    try {
+      await submitToKeeperHub(
+        intent,
+        localPoolState.buyerSettlementSig as `0x${string}`,
+        incomingSellerSig,
+      );
+      hasSubmittedSettlement = true;
+      console.log("✅ Settlement submitted to KeeperHub.");
+    } catch (e) {
+      console.error("❌ KeeperHub submission failed, will retry on next poll:", e);
+    }
+    return;
+  }
+
+  // ── Phase 1 already complete: heartbeat re-broadcast ─────────────────────
+  if (localPoolState.buyerSettlementSig) {
+    const now = Date.now();
+    if (now - lastSettlementBroadcastAt >= SETTLEMENT_REBROADCAST_INTERVAL_MS) {
+      console.log("⏳ Re-broadcasting Phase 1 payload (heartbeat)...");
+      await sendToPeer(localPoolState);
+      lastSettlementBroadcastAt = now;
+    }
+    return;
+  }
+
+  // ── Phase 1: first-time initiation ───────────────────────────────────────
+  if (signingInProgress || localPoolState.status !== "agreed") return;
+
+  const finalAgreement =
+    localPoolState.finalAgreement ?? extractFinalAgreementFromIncoming(incoming);
   if (!finalAgreement || finalAgreement.status !== "agreed") return;
 
   signingInProgress = true;
   try {
-    const agreedAmountWETH = parseAgreementAmountToBaseUnits(
-      finalAgreement.agreedAmountWETH,
-      "agreedAmountWETH"
-    );
-    const agreedAmountUSDC = parseAgreementAmountToBaseUnits(
-      finalAgreement.agreedAmountUSDC,
-      "agreedAmountUSDC"
-    );
+    const sellerAddr = process.env.SELLER_ADDRESS?.trim() as `0x${string}` | undefined;
+    if (!sellerAddr) throw new Error("Missing SELLER_ADDRESS in .env.buyer");
 
-    const signature = await account.signTypedData({
-      domain: EIP712_DOMAIN,
-      types: EIP712_TYPES,
-      primaryType: "Agreement",
-      message: {
-        agreedAmountWETH,
-        agreedAmountUSDC,
-      },
-    });
+    const { buyerNonce, sellerNonce } = await fetchNonces(account.address, sellerAddr);
+    const intent = buildDarkPoolIntent(finalAgreement, buyerNonce, sellerNonce);
+    const buyerSig = await signDarkPoolIntent(intent);
 
-    hasSignedAgreement = true;
-    console.log(`✍️ [WEB3 SIGNATURE]: ${signature}`);
+    localPoolState.intent = toWireIntent(intent);
+    localPoolState.buyerSettlementSig = buyerSig;
+    console.log(`✍️ [BUYER SETTLEMENT SIG]: ${buyerSig}`);
+
+    const inlineSeller =
+      isObject(incoming) &&
+      typeof incoming.sellerSettlementSig === "string" &&
+      incoming.sellerSettlementSig.startsWith("0x")
+        ? (incoming.sellerSettlementSig as `0x${string}`)
+        : null;
+
+    if (inlineSeller) {
+      try {
+        await submitToKeeperHub(intent, buyerSig, inlineSeller);
+        hasSubmittedSettlement = true;
+        console.log("✅ Settlement submitted to KeeperHub (inline seller sig).");
+      } catch (e) {
+        console.error("❌ KeeperHub submission failed, will retry on next poll:", e);
+      }
+      return;
+    }
+
+    await sendToPeer(localPoolState);
+    lastSettlementBroadcastAt = Date.now();
+    console.log("📡 Phase 1 broadcast: wire intent + buyerSettlementSig.");
   } catch (error: unknown) {
-    console.error("Buyer EIP-712 signing error:", error);
+    console.error("❌ Settlement Phase 1 error:", error);
+    localPoolState.intent = undefined;
+    localPoolState.buyerSettlementSig = undefined;
   } finally {
     signingInProgress = false;
   }
@@ -385,13 +807,17 @@ async function processStateUpdate(incoming: unknown) {
     const maybeStatus = incoming.status;
     const maybeTurn = incoming.turn;
     if ((maybeStatus === "agreed" || maybeStatus === "failed") && typeof maybeTurn === "number") {
-      console.log(`✅ [STATE_LOCK]: Deal closed at Turn ${maybeTurn}. Disabling AI. Awaiting EIP-712 Signing...`);
+      console.log(`✅ [STATE_LOCK]: Deal closed at Turn ${maybeTurn}. Disabling AI. Entering settlement...`);
       lastCompletedTurn = Infinity;
       localPoolState.status = maybeStatus;
       localPoolState.turn = maybeTurn;
 
       if (maybeStatus === "agreed") {
-        await signFinalAgreementIfNeeded(incoming);
+        if (!localPoolState.finalAgreement) {
+          const fa = extractFinalAgreementFromIncoming(incoming);
+          if (fa) localPoolState.finalAgreement = fa;
+        }
+        await handleSettlement(incoming);
       }
       return;
     }
@@ -455,6 +881,14 @@ ${historyPrompt}`;
       localPoolState.finalAgreement = parsedUnknown;
     }
 
+    // Buyer-first agree: run settlement Phase 1 before mesh send so Seller never sees naked agreed
+    if (parsedUnknown.status === "agreed") {
+      lastCompletedTurn = Infinity;
+      await handleSettlement({});
+      await sendToPeer(localPoolState);
+      return;
+    }
+
     await sendToPeer(localPoolState);
     lastCompletedTurn = state.turn;
   } catch (error: unknown) {
@@ -465,16 +899,31 @@ ${historyPrompt}`;
 }
 
 async function pollIncomingMessages() {
-  if (lastCompletedTurn === Infinity) return;
+  if (hasSubmittedSettlement) return;
 
   try {
     const response = await axlHttp.get("/recv", { responseType: "text" });
-    if (response.status === 204 || response.status === 404) return;
+
+    if (response.status === 204 || response.status === 404) {
+      if (localPoolState.status === "agreed" && !hasSubmittedSettlement) {
+        await handleSettlement({});
+      }
+      return;
+    }
 
     const raw = typeof response.data === "string" ? response.data : JSON.stringify(response.data);
     const incomingState = safeJsonParse<DarkPoolState>(raw);
     if (!incomingState) return;
     if (!isDarkPoolState(incomingState)) return;
+
+    if (localPoolState.status === "agreed" && !hasSubmittedSettlement) {
+      if (!localPoolState.finalAgreement && incomingState.finalAgreement) {
+        localPoolState.finalAgreement = incomingState.finalAgreement;
+      }
+      await handleSettlement(incomingState);
+      return;
+    }
+
     if (!isNewerState(incomingState)) return;
 
     localPoolState = incomingState;
@@ -482,6 +931,40 @@ async function pollIncomingMessages() {
   } catch {
     // ignore transient empty-queue/timeouts
   }
+}
+
+async function initKeeperHubMcp(): Promise<void> {
+  const apiKey = process.env.KEEPERHUB_API_KEY?.replace(/['"]/g, '').trim();
+  if (!apiKey) {
+    throw new Error("Missing KEEPERHUB_API_KEY in environment.");
+  }
+
+  const transport = new StreamableHTTPClientTransport(new URL("https://app.keeperhub.com/mcp"), {
+    requestInit: {
+      headers: {
+        Authorization: `Bearer ${apiKey}`,
+      },
+    },
+  });
+
+  transport.onerror = (error) => {
+    console.error("KeeperHub MCP transport error:", error);
+  };
+
+  transport.onclose = () => {
+    console.warn("KeeperHub MCP transport closed.");
+  };
+
+  await keeperHubClient.connect(transport);
+  console.log("✅ KeeperHub MCP Connected!");
+
+  const { tools } = await keeperHubClient.listTools();
+  const toolNames = tools.map((tool) => tool.name);
+  console.log(
+    `🛠️ KeeperHub tools loaded (${toolNames.length}): ${
+      toolNames.length ? toolNames.join(", ") : "(none)"
+    }`
+  );
 }
 
 console.log("🟢 Agent A (Buyer) Booting Up...");
@@ -509,13 +992,22 @@ function startPolling() {
   void loop();
 }
 
-startPolling();
+async function bootstrapBuyerAgent() {
+  // Ensure KeeperHub MCP is online before starting the negotiation loop.
+  await initKeeperHubMcp();
 
-// BOOTSTRAP THE MESH: Buyer makes the first move
-setTimeout(() => {
-  if (localPoolState.turn === 0) {
-    console.log("🚀 Bootstrapping P2P Negotiation...");
-    // Manually trigger the first state evaluation
-    void processStateUpdate(localPoolState);
-  }
-}, 3000);
+  startPolling();
+
+  // BOOTSTRAP THE MESH: Buyer makes the first move
+  setTimeout(() => {
+    if (localPoolState.turn === 0) {
+      console.log("🚀 Bootstrapping P2P Negotiation...");
+      void processStateUpdate(localPoolState);
+    }
+  }, 3000);
+}
+
+void bootstrapBuyerAgent().catch((error) => {
+  console.error("❌ Failed to bootstrap Buyer agent:", error);
+  process.exit(1);
+});

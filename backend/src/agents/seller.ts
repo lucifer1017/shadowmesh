@@ -28,6 +28,38 @@ interface DarkPoolState {
   turn: number;
   history: MovePayload[];
   finalAgreement?: AgreementData | null;
+  intent?: WireDarkPoolIntent;
+  buyerSettlementSig?: string;
+  sellerSettlementSig?: string;
+}
+
+/** JSON-safe mirror of DarkPoolIntentArg for mesh transport */
+interface WireDarkPoolIntent {
+  tokenIn:     `0x${string}`;
+  tokenOut:    `0x${string}`;
+  fee:         number;
+  tickSpacing: number;
+  amountIn:    string;
+  amountOut:   string;
+  buyer:       `0x${string}`;
+  seller:      `0x${string}`;
+  buyerNonce:  string;
+  sellerNonce: string;
+  deadline:    string;
+}
+
+interface DarkPoolIntentArg {
+  tokenIn:     `0x${string}`;
+  tokenOut:    `0x${string}`;
+  fee:         number;
+  tickSpacing: number;
+  amountIn:    bigint;
+  amountOut:   bigint;
+  buyer:       `0x${string}`;
+  seller:      `0x${string}`;
+  buyerNonce:  bigint;
+  sellerNonce: bigint;
+  deadline:    bigint;
 }
 
 type AgentResponse = AgreementData;
@@ -81,16 +113,29 @@ const signerPrivateKey = process.env.AGENT_B_PRIVATE_KEY
 
 const account = privateKeyToAccount(signerPrivateKey);
 
-const EIP712_DOMAIN = {
-  name: "DarkPool",
+// Settlement EIP-712 — must match ShadowMeshHook + buyer.ts exactly
+const HOOK_ADDRESS = "0xb76306D31e12336F0D8C62497190ae49f06Bc080" as const;
+
+const SETTLEMENT_DOMAIN = {
+  name: "ShadowMesh",
   version: "1",
   chainId: 11155111,
+  verifyingContract: HOOK_ADDRESS,
 } as const;
 
-const EIP712_TYPES = {
-  Agreement: [
-    { name: "agreedAmountWETH", type: "uint256" },
-    { name: "agreedAmountUSDC", type: "uint256" },
+const DARK_POOL_INTENT_TYPES = {
+  DarkPoolIntent: [
+    { name: "tokenIn",     type: "address" },
+    { name: "tokenOut",    type: "address" },
+    { name: "fee",         type: "uint24"  },
+    { name: "tickSpacing", type: "int24"   },
+    { name: "amountIn",    type: "uint256" },
+    { name: "amountOut",   type: "uint256" },
+    { name: "buyer",       type: "address" },
+    { name: "seller",      type: "address" },
+    { name: "buyerNonce",  type: "uint256" },
+    { name: "sellerNonce", type: "uint256" },
+    { name: "deadline",    type: "uint256" },
   ],
 } as const;
 
@@ -116,8 +161,8 @@ const GENERATION_TIMEOUT_MS = 30_000;
 
 let inFlightTurn: number | null = null;
 let lastCompletedTurn = -1;
-let hasSignedAgreement = false;
 let signingInProgress = false;
+let hasSellerSettlementSig = false;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
@@ -317,37 +362,110 @@ function extractFinalAgreementFromIncoming(incoming: unknown): AgreementData | n
   return candidate;
 }
 
-async function signFinalAgreementIfNeeded(incoming: unknown): Promise<void> {
-  if (hasSignedAgreement || signingInProgress) return;
+/** Parse Buyer's wire intent back to bigint struct for EIP-712 signing */
+function parseBuyerIntent(wire: unknown): DarkPoolIntentArg | null {
+  if (!isObject(wire)) return null;
+  const w = wire as Record<string, unknown>;
+  try {
+    const tokenIn  = typeof w.tokenIn === "string" ? (w.tokenIn as `0x${string}`) : null;
+    const tokenOut = typeof w.tokenOut === "string" ? (w.tokenOut as `0x${string}`) : null;
+    const buyer    = typeof w.buyer === "string" ? (w.buyer as `0x${string}`) : null;
+    const seller   = typeof w.seller === "string" ? (w.seller as `0x${string}`) : null;
+    const fee =
+      typeof w.fee === "number" ? w.fee : typeof w.fee === "string" ? parseInt(String(w.fee), 10) : NaN;
+    const tickSpacing =
+      typeof w.tickSpacing === "number"
+        ? w.tickSpacing
+        : typeof w.tickSpacing === "string"
+          ? parseInt(String(w.tickSpacing), 10)
+          : NaN;
 
-  const finalAgreement = extractFinalAgreementFromIncoming(incoming);
-  if (!finalAgreement || finalAgreement.status !== "agreed") return;
+    if (!tokenIn || !tokenOut || !buyer || !seller || !Number.isFinite(fee) || !Number.isFinite(tickSpacing)) {
+      return null;
+    }
+
+    return {
+      tokenIn,
+      tokenOut,
+      fee,
+      tickSpacing,
+      buyer,
+      seller,
+      amountIn: BigInt(String(w.amountIn)),
+      amountOut: BigInt(String(w.amountOut)),
+      buyerNonce: BigInt(String(w.buyerNonce)),
+      sellerNonce: BigInt(String(w.sellerNonce)),
+      deadline: BigInt(String(w.deadline)),
+    };
+  } catch {
+    return null;
+  }
+}
+
+async function signDarkPoolIntent(intent: DarkPoolIntentArg): Promise<`0x${string}`> {
+  return account.signTypedData({
+    domain: SETTLEMENT_DOMAIN,
+    types: DARK_POOL_INTENT_TYPES,
+    primaryType: "DarkPoolIntent",
+    message: intent,
+  });
+}
+
+async function handleSellerSettlement(incoming: unknown): Promise<void> {
+  if (hasSellerSettlementSig) return;
+  if (signingInProgress) return;
+  if (!isObject(incoming)) return;
+
+  const buyerSig = incoming.buyerSettlementSig;
+  if (typeof buyerSig !== "string" || !buyerSig.startsWith("0x")) {
+    console.warn("Settlement: buyerSettlementSig missing — waiting for Buyer Phase 1 broadcast.");
+    return;
+  }
+
+  const intent = parseBuyerIntent(incoming.intent);
+  if (!intent) {
+    console.error("Settlement: missing or malformed wire intent from Buyer.");
+    return;
+  }
+
+  if (intent.seller.toLowerCase() !== account.address.toLowerCase()) {
+    console.error(`Settlement: intent.seller (${intent.seller}) ≠ this wallet (${account.address}).`);
+    return;
+  }
+
+  const nowSec = BigInt(Math.floor(Date.now() / 1000));
+  if (intent.deadline <= nowSec) {
+    console.error(`Settlement: intent deadline expired (${intent.deadline} ≤ ${nowSec}).`);
+    return;
+  }
+
+  const agreed = localPoolState.finalAgreement;
+  if (agreed?.status === "agreed") {
+    const expectIn = parseAgreementAmountToBaseUnits(agreed.agreedAmountUSDC, "agreedAmountUSDC");
+    const expectOut = parseAgreementAmountToBaseUnits(agreed.agreedAmountWETH, "agreedAmountWETH");
+    if (intent.amountIn !== expectIn || intent.amountOut !== expectOut) {
+      console.error("Settlement: intent amounts mismatch negotiated finalAgreement — refusing to sign.");
+      return;
+    }
+  }
 
   signingInProgress = true;
   try {
-    const agreedAmountWETH = parseAgreementAmountToBaseUnits(
-      finalAgreement.agreedAmountWETH,
-      "agreedAmountWETH"
-    );
-    const agreedAmountUSDC = parseAgreementAmountToBaseUnits(
-      finalAgreement.agreedAmountUSDC,
-      "agreedAmountUSDC"
-    );
+    const sellerSig = await signDarkPoolIntent(intent);
+    console.log(`✍️ [SELLER SETTLEMENT SIG]: ${sellerSig}`);
 
-    const signature = await account.signTypedData({
-      domain: EIP712_DOMAIN,
-      types: EIP712_TYPES,
-      primaryType: "Agreement",
-      message: {
-        agreedAmountWETH,
-        agreedAmountUSDC,
-      },
-    });
+    localPoolState.sellerSettlementSig = sellerSig;
+    localPoolState.buyerSettlementSig = buyerSig;
+    if (incoming.intent && isObject(incoming.intent)) {
+      localPoolState.intent = incoming.intent as unknown as WireDarkPoolIntent;
+    }
 
-    hasSignedAgreement = true;
-    console.log(`✍️ [WEB3 SIGNATURE]: ${signature}`);
-  } catch (error: unknown) {
-    console.error("Seller EIP-712 signing error:", error);
+    await sendToPeer(localPoolState);
+    hasSellerSettlementSig = true;
+    console.log("📡 Seller settlement sig sent to Buyer.");
+  } catch (e) {
+    console.error("❌ Seller settlement error:", e);
+    localPoolState.sellerSettlementSig = undefined;
   } finally {
     signingInProgress = false;
   }
@@ -385,13 +503,17 @@ async function processStateUpdate(incoming: unknown) {
     const maybeStatus = incoming.status;
     const maybeTurn = incoming.turn;
     if ((maybeStatus === "agreed" || maybeStatus === "failed") && typeof maybeTurn === "number") {
-      console.log(`✅ [STATE_LOCK]: Deal closed at Turn ${maybeTurn}. Disabling AI. Awaiting EIP-712 Signing...`);
+      console.log(`✅ [STATE_LOCK]: Deal closed at Turn ${maybeTurn}. Disabling AI. Entering settlement...`);
       lastCompletedTurn = Infinity;
       localPoolState.status = maybeStatus;
       localPoolState.turn = maybeTurn;
 
       if (maybeStatus === "agreed") {
-        await signFinalAgreementIfNeeded(incoming);
+        if (!localPoolState.finalAgreement) {
+          const fa = extractFinalAgreementFromIncoming(incoming);
+          if (fa) localPoolState.finalAgreement = fa;
+        }
+        await handleSellerSettlement(incoming);
       }
       return;
     }
@@ -456,7 +578,7 @@ ${historyPrompt}`;
     }
 
     await sendToPeer(localPoolState);
-    lastCompletedTurn = state.turn;
+    lastCompletedTurn = parsedUnknown.status === "agreed" ? Infinity : state.turn;
   } catch (error: unknown) {
     console.error("Seller AI Generation Error:", error);
   } finally {
@@ -465,7 +587,7 @@ ${historyPrompt}`;
 }
 
 async function pollIncomingMessages() {
-  if (lastCompletedTurn === Infinity) return;
+  if (hasSellerSettlementSig) return;
 
   try {
     const response = await axlHttp.get("/recv", { responseType: "text" });
@@ -475,6 +597,19 @@ async function pollIncomingMessages() {
     const incomingState = safeJsonParse<DarkPoolState>(raw);
     if (!incomingState) return;
     if (!isDarkPoolState(incomingState)) return;
+
+    // Buyer's Phase 1 broadcast has the same turn as locked state — bypass isNewerState
+    const incomingIsAgreed = isObject(incomingState) && incomingState.status === "agreed";
+    if ((localPoolState.status === "agreed" || incomingIsAgreed) && !hasSellerSettlementSig) {
+      if (!localPoolState.finalAgreement && incomingState.finalAgreement) {
+        localPoolState.finalAgreement = incomingState.finalAgreement;
+      }
+      localPoolState.status = "agreed";
+      lastCompletedTurn = Infinity;
+      await handleSellerSettlement(incomingState);
+      return;
+    }
+
     if (!isNewerState(incomingState)) return;
 
     localPoolState = incomingState;
