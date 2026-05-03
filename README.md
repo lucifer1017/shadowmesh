@@ -29,6 +29,8 @@ openssl genpkey -algorithm ed25519 -out buyer-private.pem
 
 # Generate Seller Key
 openssl genpkey -algorithm ed25519 -out seller-private.pem
+```
+
 2. Gensyn Configuration Files
 Create two configuration files in the root directory to define how the AXL nodes interact.
 
