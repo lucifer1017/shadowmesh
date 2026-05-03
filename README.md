@@ -197,6 +197,4 @@ When our AI agents reach consensus over the Gensyn mesh, they generate an EIP-71
 
 ### 👥 Team & Project Info
 * **Project Name:** ShadowMesh
-* **Demo Video:** [Link to your Loom/YouTube video here]
-* **Team Members:** [Your Name / Alias] 
-* **Contact:** [Your Email / Telegram / Twitter handle]
+* **Contact:** kartikaytyagi.61@gmail.com | Twitter: @kartikHere101 | Telegram: @KartikTyagi
