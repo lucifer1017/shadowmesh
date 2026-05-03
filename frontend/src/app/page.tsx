@@ -11,13 +11,11 @@ export default function Home() {
   const terminalRef = useRef<HTMLPreElement>(null);
   const abortRef = useRef<AbortController | null>(null);
 
-  // Auto-scroll terminal to bottom on new log chunks
   useEffect(() => {
     const el = terminalRef.current;
     if (el) el.scrollTop = el.scrollHeight;
   }, [logs]);
 
-  // Abort any in-flight request on unmount
   useEffect(() => {
     return () => {
       abortRef.current?.abort();
@@ -25,7 +23,6 @@ export default function Home() {
   }, []);
 
   async function initiateProtocol() {
-    // Cancel any previous in-flight stream before starting a new one
     abortRef.current?.abort();
     const controller = new AbortController();
     abortRef.current = controller;
@@ -57,10 +54,8 @@ export default function Home() {
         if (done) break;
         if (value) setLogs((prev) => prev + decoder.decode(value, { stream: true }));
       }
-      // Flush any remaining buffered partial characters
       setLogs((prev) => prev + decoder.decode());
     } catch (e) {
-      // DOMException with name "AbortError" means the user intentionally aborted — not an error
       if (e instanceof DOMException && e.name === "AbortError") return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
@@ -70,17 +65,14 @@ export default function Home() {
 
   return (
     <div className="relative min-h-screen overflow-hidden bg-black font-mono text-emerald-400">
-      {/* CRT radial glow */}
       <div
         className="pointer-events-none absolute inset-0 bg-[radial-gradient(ellipse_at_50%_20%,rgba(16,185,129,0.14)_0%,transparent_55%)]"
         aria-hidden
       />
-      {/* Matrix grid */}
       <div
         className="pointer-events-none absolute inset-0 opacity-80 [background-image:linear-gradient(rgba(16,185,129,0.06)_1px,transparent_1px),linear-gradient(90deg,rgba(16,185,129,0.06)_1px,transparent_1px)] [background-size:28px_28px] [mask-image:radial-gradient(ellipse_at_center,black,transparent_75%)]"
         aria-hidden
       />
-      {/* CRT scanline overlay */}
       <div
         className="pointer-events-none absolute inset-0 opacity-20 mix-blend-overlay [background-image:repeating-linear-gradient(0deg,rgba(0,0,0,0.25)_0px,rgba(0,0,0,0.25)_1px,transparent_2px,transparent_4px)]"
         aria-hidden
@@ -88,7 +80,6 @@ export default function Home() {
 
       <div className="relative z-10 mx-auto flex min-h-screen max-w-[1600px] flex-col gap-6 px-4 py-6 sm:px-8">
 
-        {/* ── Industrial header ── */}
         <header className="flex flex-col gap-4 border-b border-emerald-900/40 pb-5 sm:flex-row sm:items-end sm:justify-between">
           <div>
             <p className="text-[10px] uppercase tracking-[0.35em] text-emerald-700/80">
@@ -120,7 +111,6 @@ export default function Home() {
 
         <div className="grid flex-1 gap-6 lg:grid-cols-[360px_1fr] lg:items-start">
 
-          {/* ── Control module ── */}
           <section className="rounded-lg border border-green-900/50 bg-zinc-950/90 p-5 shadow-[0_0_40px_rgba(6,78,59,0.25)] backdrop-blur-sm">
             <p className="text-[9px] uppercase tracking-[0.3em] text-emerald-700/80">
               control module // negotiation ingress
@@ -163,7 +153,6 @@ export default function Home() {
               </div>
             ) : null}
 
-            {/* Static info panel */}
             <div className="mt-8 space-y-2 border-t border-emerald-900/30 pt-4 text-[10px] text-emerald-700/70">
               <p>ORACLE: PYTH HERMES PRICE FEEDS</p>
               <p>HOOK: SHADOWMESH V4 HOOK</p>
@@ -172,9 +161,7 @@ export default function Home() {
             </div>
           </section>
 
-          {/* ── Live terminal ── */}
           <section className="flex min-h-[65vh] flex-1 flex-col rounded-lg border border-emerald-900/35 bg-black/90 shadow-[inset_0_0_100px_rgba(16,185,129,0.05),0_0_60px_rgba(6,78,59,0.3)]">
-            {/* Status bar */}
             <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-emerald-900/30 bg-zinc-950/90 px-4 py-2 text-[10px] uppercase tracking-[0.15em] text-emerald-600/90">
               <span className="text-emerald-400 [text-shadow:_0_0_8px_rgb(52_211_153_/_0.6)]">
                 [ SYSTEM: ONLINE ]
@@ -189,7 +176,6 @@ export default function Home() {
               </span>
             </div>
 
-            {/* Terminal body */}
             <pre
               ref={terminalRef}
               className="flex-1 overflow-y-auto whitespace-pre-wrap break-words bg-black px-5 py-4 text-[12.5px] leading-relaxed text-emerald-400 [scrollbar-width:none] [-ms-overflow-style:none] [text-shadow:_0_0_8px_rgb(52_211_153_/_0.4)] [&::-webkit-scrollbar]:hidden"

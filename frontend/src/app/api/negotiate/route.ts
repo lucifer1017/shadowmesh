@@ -36,7 +36,6 @@ export async function POST(req: NextRequest) {
         try {
           controller.close();
         } catch {
-          /* already closed */
         }
       };
 
@@ -72,7 +71,6 @@ export async function POST(req: NextRequest) {
         try {
           child.kill("SIGTERM");
         } catch {
-          /* ignore */
         }
         safeClose();
         return;
@@ -83,7 +81,6 @@ export async function POST(req: NextRequest) {
         try {
           child.kill("SIGTERM");
         } catch {
-          /* ignore */
         }
       };
       req.signal.addEventListener("abort", onAbort);

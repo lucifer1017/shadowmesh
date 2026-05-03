@@ -33,7 +33,6 @@ interface DarkPoolState {
   sellerSettlementSig?: string;
 }
 
-/** JSON-safe mirror of DarkPoolIntentArg for mesh transport */
 interface WireDarkPoolIntent {
   tokenIn:     `0x${string}`;
   tokenOut:    `0x${string}`;
@@ -72,7 +71,7 @@ interface ParsedGenAIError {
 
 async function fetchLiveWethPrice(): Promise<number> {
   try {
-    const feedId = "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace"; // WETH/USD
+    const feedId = "ff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace";
     const url = `https://hermes.pyth.network/v2/updates/price/latest?ids[]=${feedId}`;
     const response = await axios.get(url, { timeout: 10_000 });
     const parsed0 = response.data?.parsed?.[0];
@@ -93,9 +92,6 @@ async function fetchLiveWethPrice(): Promise<number> {
 
 const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
-// ==========================================
-// GENSYN AXL: P2P Network Configuration
-// ==========================================
 const AXL_PORT = process.env.AXL_PORT || "9002";
 const TARGET_PUBKEY = process.env.TARGET_PUBKEY?.trim();
 
@@ -134,7 +130,6 @@ const signerPrivateKey = process.env.AGENT_B_PRIVATE_KEY
 
 const account = privateKeyToAccount(signerPrivateKey);
 
-// Settlement EIP-712 — must match ShadowMeshHook + buyer.ts exactly
 const HOOK_ADDRESS = "0xb76306D31e12336F0D8C62497190ae49f06Bc080" as const;
 
 const SETTLEMENT_DOMAIN = {
@@ -383,7 +378,6 @@ function extractFinalAgreementFromIncoming(incoming: unknown): AgreementData | n
   return candidate;
 }
 
-/** Parse Buyer's wire intent back to bigint struct for EIP-712 signing */
 function parseBuyerIntent(wire: unknown): DarkPoolIntentArg | null {
   if (!isObject(wire)) return null;
   const w = wire as Record<string, unknown>;
@@ -636,7 +630,6 @@ async function pollIncomingMessages() {
     if (!incomingState) return;
     if (!isDarkPoolState(incomingState)) return;
 
-    // Buyer's Phase 1 broadcast has the same turn as locked state — bypass isNewerState
     const incomingIsAgreed = isObject(incomingState) && incomingState.status === "agreed";
     if ((localPoolState.status === "agreed" || incomingIsAgreed) && !hasSellerSettlementSig) {
       if (!localPoolState.finalAgreement && incomingState.finalAgreement) {
@@ -653,7 +646,6 @@ async function pollIncomingMessages() {
     localPoolState = incomingState;
     await processStateUpdate(localPoolState);
   } catch {
-    // ignore transient empty-queue/timeouts
   }
 }
 
