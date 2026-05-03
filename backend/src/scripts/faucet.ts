@@ -92,31 +92,57 @@ async function main() {
   console.log(`Agent A (Buyer): ${agentAAccount.address}`);
   console.log(`Agent B (Seller): ${agentBAccount.address}`);
 
-  console.log("Minting Mock USDC to Agent A...");
-  const usdcMintHash = await client.writeContract({
-    address: mockUsdcAddress,
-    abi: MOCK_ERC20_ABI,
-    functionName: "mint",
-    args: [agentAAccount.address, USDC_MINT_AMOUNT],
-  });
-  console.log(`USDC mint tx sent: ${usdcMintHash}`);
+  const fundingRounds = [
+    {
+      agentLabel: "Agent A",
+      recipient: agentAAccount.address,
+    },
+    {
+      agentLabel: "Agent B",
+      recipient: agentBAccount.address,
+    },
+  ] as const;
 
-  const usdcReceipt = await client.waitForTransactionReceipt({ hash: usdcMintHash });
-  console.log(`USDC mint confirmed in block ${usdcReceipt.blockNumber}`);
+  const mintSequence = [
+    {
+      tokenLabel: "Mock USDC",
+      tokenAddress: mockUsdcAddress,
+      amount: USDC_MINT_AMOUNT,
+    },
+    {
+      tokenLabel: "Mock WETH",
+      tokenAddress: mockWethAddress,
+      amount: WETH_MINT_AMOUNT,
+    },
+  ] as const;
 
-  console.log("Minting Mock WETH to Agent B...");
-  const wethMintHash = await client.writeContract({
-    address: mockWethAddress,
-    abi: MOCK_ERC20_ABI,
-    functionName: "mint",
-    args: [agentBAccount.address, WETH_MINT_AMOUNT],
-  });
-  console.log(`WETH mint tx sent: ${wethMintHash}`);
+  for (const { agentLabel, recipient } of fundingRounds) {
+    console.log(`\nMinting Mock USDC & Mock WETH to ${agentLabel}...`);
 
-  const wethReceipt = await client.waitForTransactionReceipt({ hash: wethMintHash });
-  console.log(`WETH mint confirmed in block ${wethReceipt.blockNumber}`);
+    for (const { tokenLabel, tokenAddress, amount } of mintSequence) {
+      const { request } = await client.simulateContract({
+        account: keeperAccount,
+        address: tokenAddress,
+        abi: MOCK_ERC20_ABI,
+        functionName: "mint",
+        args: [recipient, amount],
+      });
 
-  console.log("Faucet mint flow completed successfully.");
+      const hash = await client.writeContract(request);
+      console.log(`  ${tokenLabel} mint tx sent: ${hash}`);
+
+      const receipt = await client.waitForTransactionReceipt({ hash });
+      if (receipt.status !== "success") {
+        throw new Error(
+          `${tokenLabel} mint to ${agentLabel} failed (status: ${receipt.status}, tx: ${hash})`
+        );
+      }
+
+      console.log(`  ${tokenLabel} mint confirmed in block ${receipt.blockNumber}`);
+    }
+  }
+
+  console.log("\nFaucet mint flow completed successfully.");
 }
 
 main().catch((error) => {
