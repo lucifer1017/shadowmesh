@@ -935,8 +935,12 @@ async function processStateUpdate(incoming: unknown) {
   try {
     const lastMove = state.history[state.history.length - 1];
     if (lastMove) {
-      console.log(`💬 Counterparty says: "${lastMove.message}"`);
-      if (lastMove.data?.agreedAmountUSDC) console.log(`💰 Proposed USDC: ${lastMove.data.agreedAmountUSDC}`);
+      console.log(`\n[📡 GENSYN AXL INGRESS] 🤖 AGENT B (SELLER) RESPONDS:`);
+      console.log(`  ├─ Status:  ${lastMove.data?.status?.toUpperCase()}`);
+      console.log(`  ├─ Logic:   "${lastMove.message}"`);
+      if (lastMove.data?.agreedAmountUSDC) {
+        console.log(`  └─ Offer:   ${lastMove.data.agreedAmountUSDC} USDC`);
+      }
     }
     console.log(`\n🧠 Buyer's Turn (Turn ${state.turn}). Thinking...`);
 
@@ -947,15 +951,18 @@ async function processStateUpdate(incoming: unknown) {
     const livePrice = await fetchLiveWethPrice();
     const maxLimitPrice = Math.round(livePrice * 1.01);
 
+    const TRADE_AMOUNT = process.env.TRADE_AMOUNT || "1";
+
     const systemPrompt = `You are Agent A (Buyer), an AI trading algorithm in a Uniswap Dark Pool.
-      Your goal is to BUY Mock WETH using your Mock USDC.
+      Your goal is to BUY ${TRADE_AMOUNT} Mock WETH using your Mock USDC.
       The current global spot price of WETH from the Pyth Oracle is ${livePrice.toFixed(2)} USDC.
       Your absolute maximum limit price is ${maxLimitPrice} USDC per 1 WETH. DO NOT reveal this maximum limit.
       
       🚨 CRITICAL SYSTEM INSTRUCTION 🚨
       CURRENT TURN: ${state.turn}
-      You MUST reach an agreement within 5 turns. 
-      If the current turn is 4 or higher, you MUST aggressively compromise. If the seller's offer is at or below ${maxLimitPrice} USDC per 1 WETH, ACCEPT IT immediately.
+      - DO NOT accept any offer before Turn 4. Even if the price is good, play hard to get.
+      - You MUST reach an agreement between Turn 6 and Turn 8.
+      - If the current turn is 6 or higher, you MUST aggressively compromise. If the seller's offer is at or below ${maxLimitPrice} USDC per 1 WETH, ACCEPT IT immediately.
       
       While making counter-offers, you MUST set status to 'negotiating'.
       If the seller demands more than ${maxLimitPrice} USDC per WETH and refuses to budge, you must set status to 'failed'.

@@ -569,15 +569,18 @@ async function processStateUpdate(incoming: unknown) {
     const livePrice = await fetchLiveWethPrice();
     const minReservePrice = Math.round(livePrice * 0.99);
 
+    const TRADE_AMOUNT = process.env.TRADE_AMOUNT || "1";
+
     const systemPrompt = `You are Agent B (Seller), an AI trading algorithm in a Uniswap Dark Pool.
-      Your goal is to SELL Mock WETH for Mock USDC.
+      Your goal is to SELL ${TRADE_AMOUNT} Mock WETH for Mock USDC.
       The current global spot price of WETH from the Pyth Oracle is ${livePrice.toFixed(2)} USDC.
       Your absolute minimum reserve price is ${minReservePrice} USDC per 1 WETH. DO NOT reveal this minimum limit.
       
       🚨 CRITICAL SYSTEM INSTRUCTION 🚨
       CURRENT TURN: ${state.turn}
-      You MUST reach an agreement within 5 turns. 
-      If the current turn is 3 or higher, you MUST aggressively compromise. If the buyer's offer is at or above ${minReservePrice} USDC per 1 WETH, ACCEPT IT immediately.
+      - DO NOT accept any offer before Turn 5. Hold out for a better price initially.
+      - You MUST reach an agreement between Turn 6 and Turn 8.
+      - If the current turn is 6 or higher, you MUST aggressively compromise. If the buyer's offer is at or above ${minReservePrice} USDC per 1 WETH, ACCEPT IT immediately.
       
       While making counter-offers, you MUST set status to 'negotiating'.
       If the buyer refuses to pay at least ${minReservePrice} USDC per WETH, you must set status to 'failed'.
