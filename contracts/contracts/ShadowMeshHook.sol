@@ -241,8 +241,8 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
 
         poolManager.take(tokenIn, intent.seller, intent.amountIn);
 
-        int128 deltaSpecified = _toInt128(intent.amountIn);
-        int128 deltaUnspecified = -_toInt128(intent.amountOut);
+        int128 deltaSpecified =  -_toInt128(intent.amountIn);
+        int128 deltaUnspecified = _toInt128(intent.amountOut);
 
         return toBeforeSwapDelta(deltaSpecified, deltaUnspecified);
     }
