@@ -1,22 +1,26 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.24;
 
 import {BaseHook} from "@uniswap/v4-periphery/src/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-periphery/lib/v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-periphery/lib/v4-core/src/interfaces/IPoolManager.sol";
+import {IERC20Minimal} from "@uniswap/v4-periphery/lib/v4-core/src/interfaces/external/IERC20Minimal.sol";
 import {PoolKey} from "@uniswap/v4-periphery/lib/v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "@uniswap/v4-periphery/lib/v4-core/src/types/PoolOperation.sol";
-import {BeforeSwapDelta} from "@uniswap/v4-periphery/lib/v4-core/src/types/BeforeSwapDelta.sol";
-import {Currency} from "@uniswap/v4-periphery/lib/v4-core/src/types/Currency.sol";
+import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-periphery/lib/v4-core/src/types/BeforeSwapDelta.sol";
+import {Currency, CurrencyLibrary} from "@uniswap/v4-periphery/lib/v4-core/src/types/Currency.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
+import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
 import {Nonces} from "@openzeppelin/contracts/utils/Nonces.sol";
 import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/SignatureChecker.sol";
 
 /// @title ShadowMeshHook
-/// @notice Uniswap v4 gatekeeper hook for AI-negotiated dark pool intents.
-/// @dev Validates EIP-712 signatures from buyer/seller before allowing swaps.
-contract ShadowMeshHook is BaseHook, EIP712, Ownable, Nonces {
+/// @notice Uniswap v4 JIT OTC dark pool hook for AI-negotiated intents.
+/// @dev Validates buyer/seller EIP-712 signatures and uses beforeSwapReturnDelta to bypass AMM math.
+contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
+    using CurrencyLibrary for Currency;
+
     struct DarkPoolIntent {
         address tokenIn;
         address tokenOut;
@@ -43,12 +47,19 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable, Nonces {
     error IntentExpired(uint256 deadline);
     error InvalidIntent();
     error InvalidSwap();
+    error ExactOutputUnsupported();
+    error AmountTooLarge(uint256 amount);
+    error SellerTransferFailed(address token, address seller, uint256 amount);
+    error PoolManagerSettlementMismatch(address token, uint256 paid, uint256 expected);
+    error OwnershipRenounceDisabled();
     error ZeroAddress();
 
     event KeeperUpdated(address indexed oldKeeper, address indexed newKeeper);
     event DarkPoolTradeSettled(
         address indexed buyer,
         address indexed seller,
+        address indexed tokenIn,
+        address tokenOut,
         uint256 amountIn,
         uint256 amountOut
     );
@@ -82,7 +93,7 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable, Nonces {
             afterSwap: false,
             beforeDonate: false,
             afterDonate: false,
-            beforeSwapReturnDelta: false,
+            beforeSwapReturnDelta: true,
             afterSwapReturnDelta: false,
             afterAddLiquidityReturnDelta: false,
             afterRemoveLiquidityReturnDelta: false
@@ -109,15 +120,23 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable, Nonces {
         }
 
         _verifyIntentSignatures(intent, buyerSig, sellerSig);
-
         _validateIntentForSwap(intent, key, params);
 
         _useCheckedNonce(intent.buyer, intent.buyerNonce);
         _useCheckedNonce(intent.seller, intent.sellerNonce);
 
-        emit DarkPoolTradeSettled(intent.buyer, intent.seller, intent.amountIn, intent.amountOut);
+        BeforeSwapDelta noOpDelta = _settleExactInputOTC(intent);
 
-        return (BaseHook.beforeSwap.selector, BeforeSwapDelta.wrap(0), 0);
+        emit DarkPoolTradeSettled(
+            intent.buyer,
+            intent.seller,
+            intent.tokenIn,
+            intent.tokenOut,
+            intent.amountIn,
+            intent.amountOut
+        );
+
+        return (BaseHook.beforeSwap.selector, noOpDelta, 0);
     }
 
     function setAuthorizedKeeper(address newKeeper) external onlyOwner {
@@ -127,6 +146,10 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable, Nonces {
         address oldKeeper = authorizedKeeper;
         authorizedKeeper = newKeeper;
         emit KeeperUpdated(oldKeeper, newKeeper);
+    }
+
+    function renounceOwnership() public override onlyOwner {
+        revert OwnershipRenounceDisabled();
     }
 
     function _verifyIntentSignatures(
@@ -187,19 +210,61 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable, Nonces {
             ? intent.tokenIn == currency0 && intent.tokenOut == currency1
             : intent.tokenIn == currency1 && intent.tokenOut == currency0;
 
-        if (!matchesDirection || params.amountSpecified == 0 || params.amountSpecified == type(int256).min) {
+        if (!matchesDirection) {
             revert InvalidSwap();
         }
 
-        uint256 specifiedAmount = params.amountSpecified < 0
-            ? uint256(-params.amountSpecified)
-            : uint256(params.amountSpecified);
+        if (params.amountSpecified >= 0 || params.amountSpecified == type(int256).min) {
+            revert ExactOutputUnsupported();
+        }
 
-        if (
-            (params.amountSpecified < 0 && specifiedAmount != intent.amountIn)
-                || (params.amountSpecified > 0 && specifiedAmount != intent.amountOut)
-        ) {
+        uint256 specifiedAmount = uint256(-params.amountSpecified);
+        if (specifiedAmount != intent.amountIn) {
             revert InvalidSwap();
         }
+    }
+
+    function _settleExactInputOTC(DarkPoolIntent memory intent)
+        internal
+        returns (BeforeSwapDelta)
+    {
+        Currency tokenIn = Currency.wrap(intent.tokenIn);
+        Currency tokenOut = Currency.wrap(intent.tokenOut);
+
+        poolManager.sync(tokenOut);
+        _transferFrom(tokenOut, intent.seller, address(poolManager), intent.amountOut);
+        uint256 paid = poolManager.settle();
+
+        if (paid != intent.amountOut) {
+            revert PoolManagerSettlementMismatch(intent.tokenOut, paid, intent.amountOut);
+        }
+
+        poolManager.take(tokenIn, intent.seller, intent.amountIn);
+
+        int128 deltaSpecified = _toInt128(intent.amountIn);
+        int128 deltaUnspecified = -_toInt128(intent.amountOut);
+
+        return toBeforeSwapDelta(deltaSpecified, deltaUnspecified);
+    }
+
+    function _transferFrom(
+        Currency currency,
+        address from,
+        address to,
+        uint256 amount
+    ) internal {
+        address token = Currency.unwrap(currency);
+        bool success = IERC20Minimal(token).transferFrom(from, to, amount);
+
+        if (!success) {
+            revert SellerTransferFailed(token, from, amount);
+        }
+    }
+
+    function _toInt128(uint256 amount) internal pure returns (int128) {
+        if (amount > uint256(uint128(type(int128).max))) {
+            revert AmountTooLarge(amount);
+        }
+        return int128(uint128(amount));
     }
 }

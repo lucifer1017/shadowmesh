@@ -142,6 +142,18 @@ export const SHADOWMESH_HOOK_ABI = [
         "type": "address"
       },
       {
+        "indexed": true,
+        "internalType": "address",
+        "name": "tokenIn",
+        "type": "address"
+      },
+      {
+        "indexed": false,
+        "internalType": "address",
+        "name": "tokenOut",
+        "type": "address"
+      },
+      {
         "indexed": false,
         "internalType": "uint256",
         "name": "amountIn",

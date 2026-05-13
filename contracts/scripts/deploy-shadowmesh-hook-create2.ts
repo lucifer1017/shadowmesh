@@ -15,6 +15,9 @@ import {
 
 const FLAG_MASK = (1n << 14n) - 1n;
 const BEFORE_SWAP_FLAG = 1n << 7n;
+const BEFORE_SWAP_RETURNS_DELTA_FLAG = 1n << 3n;
+const REQUIRED_HOOK_FLAGS = BEFORE_SWAP_FLAG | BEFORE_SWAP_RETURNS_DELTA_FLAG;
+const MAX_SALT_ATTEMPTS = 5_000_000n;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const parametersPath = new URL("../ignition/parameters.json", import.meta.url);
 
@@ -78,8 +81,11 @@ async function main() {
   let salt = padHex("0x0", { size: 32 });
   let hookAddress = computeCreate2Address(create2Deployer.address, salt, creationCodeHash);
 
-  while ((hexToBigInt(hookAddress) & FLAG_MASK) !== BEFORE_SWAP_FLAG) {
+  while ((hexToBigInt(hookAddress) & FLAG_MASK) !== REQUIRED_HOOK_FLAGS) {
     saltNumber++;
+    if (saltNumber > MAX_SALT_ATTEMPTS) {
+      throw new Error(`Unable to mine hook flags 0x${REQUIRED_HOOK_FLAGS.toString(16)}`);
+    }
     salt = padHex(`0x${saltNumber.toString(16)}`, { size: 32 });
     hookAddress = computeCreate2Address(create2Deployer.address, salt, creationCodeHash);
   }
@@ -118,6 +124,7 @@ async function main() {
 
   console.log("Create2Deployer:", create2Deployer.address);
   console.log("ShadowMeshHook:", hookAddress);
+  console.log("Required hook flags:", `0x${REQUIRED_HOOK_FLAGS.toString(16)}`);
   console.log("Salt:", salt);
   console.log("Updated ignition/parameters.json");
 }
