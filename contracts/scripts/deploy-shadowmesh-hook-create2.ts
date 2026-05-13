@@ -13,6 +13,7 @@ import {
   type Hex,
 } from "viem";
 
+// Mirrors v4-core `Hooks.ALL_HOOK_MASK` and permission flags (least significant 14 bits of hook address).
 const FLAG_MASK = (1n << 14n) - 1n;
 const BEFORE_SWAP_FLAG = 1n << 7n;
 const BEFORE_SWAP_RETURNS_DELTA_FLAG = 1n << 3n;
@@ -57,6 +58,9 @@ async function main() {
   const keeper = requireAddress(process.env.KEEPER ?? moduleParameters.keeper, "KEEPER");
   const owner = deployerWallet.account.address;
 
+  const routerRaw = process.env.ROUTER_ADDRESS ?? "0x9B6b46e2c869aa39918Db7f52f5557FE577B6eEe";
+  const routerAddress = requireAddress(routerRaw, "ROUTER_ADDRESS");
+
   const create2Deployer = await viem.deployContract("Create2Deployer", []);
   const artifact = await artifacts.readArtifact("ShadowMeshHook");
   const bytecode = artifact.bytecode as Hex;
@@ -70,8 +74,9 @@ async function main() {
       { name: "_poolManager", type: "address" },
       { name: "initialOwner", type: "address" },
       { name: "initialKeeper", type: "address" },
+      { name: "initialAllowedSwapSenders", type: "address[]" },
     ],
-    [poolManager, owner, keeper],
+    [poolManager, owner, keeper, [routerAddress]],
   );
 
   const creationCode = concatHex([bytecode, constructorArgs]);
@@ -106,11 +111,13 @@ async function main() {
   const deployedPoolManager = await shadowMeshHook.read.poolManager();
   const deployedKeeper = await shadowMeshHook.read.authorizedKeeper();
   const deployedOwner = await shadowMeshHook.read.owner();
+  const routerAllowed = await shadowMeshHook.read.allowedSwapSender([routerAddress]);
 
   if (
     getAddress(deployedPoolManager) !== poolManager
     || getAddress(deployedKeeper) !== keeper
     || getAddress(deployedOwner) !== getAddress(owner)
+    || !routerAllowed
   ) {
     throw new Error("Deployed ShadowMeshHook constructor state mismatch");
   }
@@ -124,6 +131,7 @@ async function main() {
 
   console.log("Create2Deployer:", create2Deployer.address);
   console.log("ShadowMeshHook:", hookAddress);
+  console.log("Allowed swap sender (router):", routerAddress);
   console.log("Required hook flags:", `0x${REQUIRED_HOOK_FLAGS.toString(16)}`);
   console.log("Salt:", salt);
   console.log("Updated ignition/parameters.json");

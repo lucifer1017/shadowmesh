@@ -37,12 +37,15 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
 
     address public authorizedKeeper;
 
+    /// @notice PoolManager passes the outer swap `sender` (often Universal Router), not the EOA keeper.
+    mapping(address => bool) public allowedSwapSender;
+
     bytes32 private constant INTENT_TYPEHASH =
         keccak256(
             "DarkPoolIntent(address tokenIn,address tokenOut,uint24 fee,int24 tickSpacing,uint256 amountIn,uint256 amountOut,address buyer,address seller,uint256 buyerNonce,uint256 sellerNonce,uint256 deadline)"
         );
 
-    error UnauthorizedKeeper(address caller);
+    error SwapSenderNotAllowed(address sender);
     error InvalidAISignature();
     error IntentExpired(uint256 deadline);
     error InvalidIntent();
@@ -55,6 +58,7 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
     error ZeroAddress();
 
     event KeeperUpdated(address indexed oldKeeper, address indexed newKeeper);
+    event AllowedSwapSenderUpdated(address indexed account, bool allowed);
     event DarkPoolTradeSettled(
         address indexed buyer,
         address indexed seller,
@@ -67,12 +71,23 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
     constructor(
         IPoolManager _poolManager,
         address initialOwner,
-        address initialKeeper
+        address initialKeeper,
+        address[] memory initialAllowedSwapSenders
     ) BaseHook(_poolManager) EIP712("ShadowMesh", "1") Ownable(initialOwner) {
         if (initialKeeper == address(0)) {
             revert ZeroAddress();
         }
         authorizedKeeper = initialKeeper;
+
+        uint256 len = initialAllowedSwapSenders.length;
+        for (uint256 i = 0; i < len; i++) {
+            address a = initialAllowedSwapSenders[i];
+            if (a == address(0)) {
+                revert ZeroAddress();
+            }
+            allowedSwapSender[a] = true;
+            emit AllowedSwapSenderUpdated(a, true);
+        }
     }
 
     /// @inheritdoc BaseHook
@@ -106,8 +121,8 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
         SwapParams calldata params,
         bytes calldata hookData
     ) internal override returns (bytes4, BeforeSwapDelta, uint24) {
-        if (sender != authorizedKeeper) {
-            revert UnauthorizedKeeper(sender);
+        if (!allowedSwapSender[sender]) {
+            revert SwapSenderNotAllowed(sender);
         }
 
         (DarkPoolIntent memory intent, bytes memory buyerSig, bytes memory sellerSig) = abi.decode(
@@ -146,6 +161,14 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
         address oldKeeper = authorizedKeeper;
         authorizedKeeper = newKeeper;
         emit KeeperUpdated(oldKeeper, newKeeper);
+    }
+
+    function setAllowedSwapSender(address account, bool allowed) external onlyOwner {
+        if (account == address(0)) {
+            revert ZeroAddress();
+        }
+        allowedSwapSender[account] = allowed;
+        emit AllowedSwapSenderUpdated(account, allowed);
     }
 
     function renounceOwnership() public override onlyOwner {

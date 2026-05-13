@@ -3,7 +3,7 @@ import axios from "axios";
 import { GoogleGenAI, Type } from "@google/genai";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp";
-import { parseUnits, encodeAbiParameters, createPublicClient, http, type Hex } from "viem";
+import { parseUnits, encodeAbiParameters, createPublicClient, http, type Hex, getAddress, isAddress } from "viem";
 import { sepolia } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
@@ -139,12 +139,22 @@ const signerPrivateKey = process.env.AGENT_A_PRIVATE_KEY
 
 const account = privateKeyToAccount(signerPrivateKey);
 
-const HOOK_ADDRESS = "0xb76306D31e12336F0D8C62497190ae49f06Bc080" as const;
+function resolveHookAddress(): `0x${string}` {
+  const raw =
+    process.env.SHADOW_MESH_HOOK_ADDRESS
+    ?? "0xb76306D31e12336F0D8C62497190ae49f06Bc080";
+  if (!isAddress(raw)) {
+    throw new Error("Missing or invalid SHADOW_MESH_HOOK (or SHADOWMESH_HOOK_ADDRESS)");
+  }
+  return getAddress(raw);
+}
+
+const HOOK_ADDRESS = resolveHookAddress();
 
 const SETTLEMENT_DOMAIN = {
   name: "ShadowMesh",
   version: "1",
-  chainId: 11155111,
+  chainId: sepolia.id,
   verifyingContract: HOOK_ADDRESS,
 } as const;
 

@@ -1,7 +1,18 @@
 import "dotenv/config";
 import axios from "axios";
 import { GoogleGenAI, Type } from "@google/genai";
-import { parseUnits } from "viem";
+import {
+  createPublicClient,
+  createWalletClient,
+  erc20Abi,
+  getAddress,
+  http,
+  isAddress,
+  maxUint256,
+  parseUnits,
+  type Address,
+} from "viem";
+import { sepolia } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
 if (!process.env.GEMINI_API_KEY) {
@@ -130,12 +141,35 @@ const signerPrivateKey = process.env.AGENT_B_PRIVATE_KEY
 
 const account = privateKeyToAccount(signerPrivateKey);
 
-const HOOK_ADDRESS = "0xb76306D31e12336F0D8C62497190ae49f06Bc080" as const;
+function resolveHookAddress(): Address {
+  const raw =
+    process.env.SHADOW_MESH_HOOK_ADDRESS
+    
+    ?? "0xb76306D31e12336F0D8C62497190ae49f06Bc080";
+  if (!isAddress(raw)) {
+    throw new Error("Missing or invalid SHADOW_MESH_HOOK (or SHADOWMESH_HOOK_ADDRESS)");
+  }
+  return getAddress(raw);
+}
+
+const HOOK_ADDRESS = resolveHookAddress();
+
+const RPC_URL = process.env.SEPOLIA_RPC_URL ?? process.env.RPC_URL;
+if (!RPC_URL) {
+  throw new Error("Missing SEPOLIA_RPC_URL or RPC_URL (required for seller on-chain approvals)");
+}
+
+const publicClient = createPublicClient({ chain: sepolia, transport: http(RPC_URL) });
+const walletClient = createWalletClient({
+  account,
+  chain: sepolia,
+  transport: http(RPC_URL),
+});
 
 const SETTLEMENT_DOMAIN = {
   name: "ShadowMesh",
   version: "1",
-  chainId: 11155111,
+  chainId: sepolia.id,
   verifyingContract: HOOK_ADDRESS,
 } as const;
 
@@ -426,6 +460,62 @@ async function signDarkPoolIntent(intent: DarkPoolIntentArg): Promise<`0x${strin
   });
 }
 
+/** Ensures seller ERC20 `tokenOut` allowance to the hook covers `amountOut` (18-decimal base units on wire intent). */
+async function ensureSellerHookAllowanceTokenOut(params: {
+  tokenOut: Address;
+  amountOut: bigint;
+}): Promise<void> {
+  const hook = HOOK_ADDRESS;
+  const token = getAddress(params.tokenOut);
+  if (getAddress(SETTLEMENT_DOMAIN.verifyingContract) !== hook) {
+    throw new Error("Hook address mismatch: EIP-712 verifyingContract vs HOOK_ADDRESS");
+  }
+
+  const allowance = await publicClient.readContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [account.address, hook],
+  });
+
+  const required = params.amountOut;
+  if (allowance >= required) {
+    console.log("Seller hook allowance already sufficient for tokenOut", {
+      token,
+      required: required.toString(),
+    });
+    return;
+  }
+
+  const useInfinite = process.env.SELLER_INFINITE_HOOK_APPROVAL === "1";
+  const approvalAmount = useInfinite ? maxUint256 : required;
+
+  const { request } = await publicClient.simulateContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "approve",
+    args: [hook, approvalAmount],
+    account,
+  });
+
+  const hash = await walletClient.writeContract(request);
+  const receipt = await publicClient.waitForTransactionReceipt({ hash });
+  if (receipt.status !== "success") {
+    throw new Error(`approve(tokenOut→hook) failed (receipt status ${receipt.status})`);
+  }
+
+  const allowanceAfter = await publicClient.readContract({
+    address: token,
+    abi: erc20Abi,
+    functionName: "allowance",
+    args: [account.address, hook],
+  });
+  if (allowanceAfter < required) {
+    throw new Error("allowance still insufficient after approve; check token behavior or use SELLER_INFINITE_HOOK_APPROVAL=1");
+  }
+  console.log("Seller approved hook for tokenOut", { token, hook, tx: hash });
+}
+
 async function handleSellerSettlement(incoming: unknown): Promise<void> {
   if (hasSellerSettlementSig) return;
   if (signingInProgress) return;
@@ -466,6 +556,11 @@ async function handleSellerSettlement(incoming: unknown): Promise<void> {
 
   signingInProgress = true;
   try {
+    await ensureSellerHookAllowanceTokenOut({
+      tokenOut: getAddress(intent.tokenOut),
+      amountOut: intent.amountOut,
+    });
+
     const sellerSig = await signDarkPoolIntent(intent);
     console.log(`✍️ [SELLER SETTLEMENT SIG]: ${sellerSig}`);
 
