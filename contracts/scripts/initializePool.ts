@@ -6,7 +6,7 @@ type Address = `0x${string}`;
 const ADDRESSES = {
   mockUSDC: "0xe965fABf3277b9E49C093449fB7C04401D2835d0" as Address,
   mockWETH: "0x3491AF599bAbB788E3CE550a84eFca4c9a216416" as Address,
-  shadowMeshHook: "0x95b04b2375cB44704f31273E886BD1242F0d8088" as Address,
+  shadowMeshHook: "0x888Af040C3eb65BDCd9b03EB42C77D244e294088" as Address,
   poolManager: "0xE03A1074c86CFeDd5C142C4F04F1a1536e203543" as Address,
 };
 
