@@ -8,6 +8,7 @@ import {
   isAddress,
   keccak256,
   padHex,
+  zeroAddress,
   type Address,
   type Hex,
 } from "viem";
@@ -26,6 +27,7 @@ type ShadowMeshParameters = {
     poolManager?: string;
     keeper?: string;
     shadowMeshHook?: string;
+    shadowMeshSwapRouter?: string;
   };
 };
 
@@ -41,6 +43,13 @@ function computeCreate2Address(deployer: Address, salt: Hex, creationCodeHash: H
   return getAddress(`0x${hash.slice(26)}`);
 }
 
+function readAddress(value: unknown, label: string): Address {
+  if (typeof value !== "string" || !isAddress(value)) {
+    throw new Error(`Invalid ${label}: expected address, got ${String(value)}`);
+  }
+  return getAddress(value);
+}
+
 async function main() {
   const { viem } = await network.create();
   const publicClient = await viem.getPublicClient();
@@ -50,9 +59,8 @@ async function main() {
   const parameters = JSON.parse(rawParameters) as ShadowMeshParameters;
   const moduleParameters = parameters.ShadowMeshModule ?? {};
 
-  // 1. Load Addresses
   const poolManager = requireAddress(process.env.POOL_MANAGER ?? moduleParameters.poolManager, "POOL_MANAGER");
-  const keeper = requireAddress(process.env.KEEPER ?? moduleParameters.keeper, "KEEPER"); // Your actual Keeper wallet
+  const keeper = requireAddress(process.env.KEEPER ?? moduleParameters.keeper, "KEEPER");
   const owner = deployerWallet.account.address;
 
   const create2Deployer = await viem.deployContract("Create2Deployer", []);
@@ -63,7 +71,6 @@ async function main() {
     throw new Error("ShadowMeshHook bytecode is empty");
   }
 
-  // 2. Encode Constructor: Manager, Owner, Keeper Wallet, optional extra allowed swap senders (hook always allows `address(this)` in-contract).
   const constructorArgs = encodeAbiParameters(
     [
       { name: "_poolManager", type: "address" },
@@ -81,7 +88,6 @@ async function main() {
   let salt = padHex("0x0", { size: 32 });
   let hookAddress = computeCreate2Address(create2Deployer.address, salt, creationCodeHash);
 
-  // 3. Mine the low-bits (0x88)
   console.log(`⛏️ Mining hook address for flags 0x${REQUIRED_HOOK_FLAGS.toString(16)}...`);
   while ((hexToBigInt(hookAddress) & FLAG_MASK) !== REQUIRED_HOOK_FLAGS) {
     saltNumber++;
@@ -92,7 +98,6 @@ async function main() {
     hookAddress = computeCreate2Address(create2Deployer.address, salt, creationCodeHash);
   }
 
-  // 4. Deploy
   const existingCode = await publicClient.getBytecode({ address: hookAddress });
   if (existingCode === undefined || existingCode === "0x") {
     const txHash = await create2Deployer.write.deploy([salt, creationCode]);
@@ -104,20 +109,39 @@ async function main() {
     throw new Error("ShadowMeshHook deployment failed");
   }
 
-  // 5. Verify State — hook must allow itself as swap sender (custom router path).
   const shadowMeshHook = await viem.getContractAt("ShadowMeshHook", hookAddress);
-  const hookSelfAllowed = await shadowMeshHook.read.allowedSwapSender([hookAddress]);
 
-  if (!hookSelfAllowed) {
-    throw new Error("Hook did not set allowedSwapSender[hook] during deployment!");
+  let swapRouterAddress = readAddress(await shadowMeshHook.read.swapRouter(), "swapRouter");
+  if (swapRouterAddress === zeroAddress) {
+    console.log("📦 Deploying ShadowMeshSwapRouter...");
+    const swapRouter = await viem.deployContract("ShadowMeshSwapRouter", [poolManager, hookAddress]);
+    swapRouterAddress = getAddress(swapRouter.address);
+
+    const initTx = await shadowMeshHook.write.initializeSwapRouter([swapRouterAddress]);
+    await publicClient.waitForTransactionReceipt({ hash: initTx });
   }
 
-  parameters.ShadowMeshModule = { ...moduleParameters, shadowMeshHook: hookAddress };
+  const routerAllowed = await shadowMeshHook.read.allowedSwapSender([swapRouterAddress]);
+  const configuredRouter = readAddress(await shadowMeshHook.read.swapRouter(), "swapRouter");
+
+  if (configuredRouter !== swapRouterAddress) {
+    throw new Error("swapRouter on hook does not match deployed router");
+  }
+  if (!routerAllowed) {
+    throw new Error("ShadowMeshSwapRouter was not allowlisted on the hook");
+  }
+
+  parameters.ShadowMeshModule = {
+    ...moduleParameters,
+    shadowMeshHook: hookAddress,
+    shadowMeshSwapRouter: swapRouterAddress,
+  };
   await writeFile(parametersPath, `${JSON.stringify(parameters, null, 2)}\n`);
 
   console.log("✅ Deployment Successful!");
   console.log("ShadowMeshHook:", hookAddress);
-  console.log("allowedSwapSender[hook]:", hookSelfAllowed);
+  console.log("ShadowMeshSwapRouter:", swapRouterAddress);
+  console.log("allowedSwapSender[router]:", routerAllowed);
 }
 
 await main();

@@ -11,6 +11,7 @@ import {SwapParams} from "@uniswap/v4-periphery/lib/v4-core/src/types/PoolOperat
 import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-periphery/lib/v4-core/src/types/BeforeSwapDelta.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-periphery/lib/v4-core/src/types/Currency.sol";
 import {TransientStateLibrary} from "@uniswap/v4-periphery/lib/v4-core/src/libraries/TransientStateLibrary.sol";
+import {ShadowMeshSwapRouter} from "./ShadowMeshSwapRouter.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -19,8 +20,7 @@ import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/Signa
 
 /// @title ShadowMeshHook
 /// @notice Uniswap v4 JIT OTC dark pool hook for AI-negotiated intents.
-/// @dev Validates buyer/seller EIP-712 signatures and uses beforeSwapReturnDelta to bypass AMM math.
-/// Relayer calls `executeDarkPoolSwap` → `unlock` → `swap`; the hook settles open deltas on itself (buyer pays tokenIn, buyer receives tokenOut).
+/// @dev Keeper calls `executeDarkPoolSwap` → `unlock` → swap router → `beforeSwap` OTC → buyer/seller settlement in callback.
 contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallback {
     using CurrencyLibrary for Currency;
     using TransientStateLibrary for IPoolManager;
@@ -41,7 +41,10 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
 
     address public authorizedKeeper;
 
-    /// @notice PoolManager passes the outer swap `sender` (often Universal Router), not the EOA keeper.
+    /// @notice Thin router that calls `poolManager.swap` so `beforeSwap` runs (v4 skips hook self-calls).
+    address public swapRouter;
+
+    /// @notice PoolManager passes the outer swap `sender` (ShadowMeshSwapRouter), not the keeper EOA.
     mapping(address => bool) public allowedSwapSender;
 
     bytes32 private constant INTENT_TYPEHASH =
@@ -68,9 +71,12 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
     error UnexpectedHookCurrencyDebt(address currency);
     error UnexpectedHookCurrencyCredit(address currency);
     error ManagerDeltaNotZero();
+    error SwapRouterAlreadyInitialized();
+    error SwapRouterNotConfigured();
 
     event KeeperUpdated(address indexed oldKeeper, address indexed newKeeper);
     event AllowedSwapSenderUpdated(address indexed account, bool allowed);
+    event SwapRouterInitialized(address indexed swapRouter);
     event DarkPoolTradeSettled(
         address indexed buyer,
         address indexed seller,
@@ -91,9 +97,6 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
         }
         authorizedKeeper = initialKeeper;
 
-        allowedSwapSender[address(this)] = true;
-        emit AllowedSwapSenderUpdated(address(this), true);
-
         uint256 len = initialAllowedSwapSenders.length;
         for (uint256 i = 0; i < len; i++) {
             address a = initialAllowedSwapSenders[i];
@@ -103,6 +106,20 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
             allowedSwapSender[a] = true;
             emit AllowedSwapSenderUpdated(a, true);
         }
+    }
+
+    /// @notice One-time wire-up after CREATE2 hook deploy + `ShadowMeshSwapRouter` deploy.
+    function initializeSwapRouter(address _swapRouter) external onlyOwner {
+        if (swapRouter != address(0)) {
+            revert SwapRouterAlreadyInitialized();
+        }
+        if (_swapRouter == address(0)) {
+            revert ZeroAddress();
+        }
+        swapRouter = _swapRouter;
+        allowedSwapSender[_swapRouter] = true;
+        emit AllowedSwapSenderUpdated(_swapRouter, true);
+        emit SwapRouterInitialized(_swapRouter);
     }
 
     /// @inheritdoc BaseHook
@@ -170,7 +187,7 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
         return (BaseHook.beforeSwap.selector, noOpDelta, 0);
     }
 
-    /// @notice Entry for KeeperHub (or any `authorizedKeeper`) to run the dark-pool swap inside a PoolManager lock.
+    /// @notice Entry for KeeperHub (`authorizedKeeper`) to run the dark-pool swap inside a PoolManager lock.
     function executeDarkPoolSwap(
         PoolKey calldata key,
         SwapParams calldata params,
@@ -189,15 +206,30 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
         onlyPoolManager
         returns (bytes memory)
     {
+        if (swapRouter == address(0)) {
+            revert SwapRouterNotConfigured();
+        }
+
         (PoolKey memory key, SwapParams memory params, bytes memory hookData) =
             abi.decode(data, (PoolKey, SwapParams, bytes));
 
-        poolManager.swap(key, params, hookData);
+        ShadowMeshSwapRouter(swapRouter).swap(key, params, hookData);
 
         (DarkPoolIntent memory intent,,) = abi.decode(hookData, (DarkPoolIntent, bytes, bytes));
 
+        // Clear the hook's own open deltas (tokenOut credit → take to buyer; tokenIn debt → impossible here).
         _clearHookDeltaOnCurrency(key.currency0, intent);
         _clearHookDeltaOnCurrency(key.currency1, intent);
+
+        // Clear the router's tokenIn debt: BeforeSwapDelta(+amountIn specified, 0) causes PoolManager to
+        // assign -amountIn on the router (swap caller). Pull tokenIn from buyer and credit the router.
+        Currency tokenIn = Currency.wrap(intent.tokenIn);
+        int256 routerDebt = poolManager.currencyDelta(swapRouter, tokenIn);
+        if (routerDebt < 0) {
+            poolManager.sync(tokenIn);
+            _transferFrom(tokenIn, intent.buyer, address(poolManager), uint256(-routerDebt));
+            poolManager.settleFor(swapRouter);
+        }
 
         if (poolManager.getNonzeroDeltaCount() != 0) {
             revert ManagerDeltaNotZero();
@@ -225,7 +257,7 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
         emit AllowedSwapSenderUpdated(account, allowed);
     }
 
-    function renounceOwnership() public override onlyOwner {
+    function renounceOwnership() public view override onlyOwner {
         revert OwnershipRenounceDisabled();
     }
 
@@ -342,9 +374,12 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallba
 
         poolManager.mint(intent.seller, tokenIn.toId(), intent.amountIn);
 
-        // Exact input uses negative `amountSpecified`; Hooks adds `hookDeltaSpecified` to zero the pool leg (see Uniswap `Hooks.beforeSwap`).
+        // deltaSpecified zeros the pool leg (exact-in: amountSpecified is negative, hookDeltaSpecified cancels it).
+        // deltaUnspecified is 0: tokenOut was already settled directly above via sync/transferFrom/settle,
+        // giving the hook +amountOut WETH credit. Adding it again via BeforeSwapDelta would double-credit
+        // and cause PoolManager to try to take 2× amountOut when only amountOut was deposited.
         int128 deltaSpecified = _toInt128(intent.amountIn);
-        int128 deltaUnspecified = _toInt128(intent.amountOut);
+        int128 deltaUnspecified = 0;
 
         return toBeforeSwapDelta(deltaSpecified, deltaUnspecified);
     }

@@ -10,7 +10,8 @@
     "dev:axl-buyer": "cd ../axl && axl-node.exe -config ../buyer-config.json",
     "dev:axl-seller": "cd ../axl && axl-node.exe -config ../seller-config.json",
     "dev:buyer": "dotenv -e .env.buyer tsx watch src/agents/buyer.ts",
-    "dev:seller": "dotenv -e .env.seller tsx watch src/agents/seller.ts"
+    "dev:seller": "dotenv -e .env.seller tsx watch src/agents/seller.ts",
+    "set-keeper": "tsx src/setKeeper.ts"
   },
   "keywords": [],
   "author": "",

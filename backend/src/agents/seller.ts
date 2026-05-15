@@ -145,9 +145,9 @@ function resolveHookAddress(): Address {
   const raw =
     process.env.SHADOW_MESH_HOOK_ADDRESS
     
-    ?? "0xb76306D31e12336F0D8C62497190ae49f06Bc080";
+    ?? "0xA9534AE3AE3712f2B1270895e2fEff401F5f4088";
   if (!isAddress(raw)) {
-    throw new Error("Missing or invalid SHADOW_MESH_HOOK (or SHADOWMESH_HOOK_ADDRESS)");
+    throw new Error("Missing or invalid SHADOW_MESH_HOOK_ADDRESS");
   }
   return getAddress(raw);
 }

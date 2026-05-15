@@ -1,5 +1,6 @@
 {
   "ShadowMeshModule": {
-    "shadowMeshHook": "0xFDeB2f31f85c56E2C8aB68b34a48fd1F08e44088"
+    "shadowMeshHook": "0x95b04b2375cB44704f31273E886BD1242F0d8088",
+    "shadowMeshSwapRouter": "0x5791A7bD330C91be657F93835481769fAa2F4dF6"
   }
 }
