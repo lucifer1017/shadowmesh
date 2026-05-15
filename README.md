@@ -15,7 +15,7 @@ In modern DeFi, large-volume execution suffers from **Intent Leakage**. Trading 
 2. **The Dark Room (Gensyn AXL):** The Buyer and Seller AI agents connect via the Gensyn AXL P2P mesh network. They fetch live pricing from the **Pyth Network** and begin high-frequency haggling completely off-chain with zero public footprint.
 3. **The State Lock (EIP-712):** Upon reaching an agreement, both agents generate a strictly typed `DarkPoolIntent` payload and sign it using EIP-712 cryptographic standards.
 4. **Stealth Routing (KeeperHub):** To avoid the public mempool, the Buyer agent routes the signed payload through KeeperHub.
-5. **Trustless Settlement (Uniswap v4):** KeeperHub submits the transaction to the Uniswap v4 Router. Our custom `ShadowMeshHook` intercepts the swap, mathematically recovers the AI signatures, and verifies the exact intent before allowing the pool to process the trade.
+5. **Trustless Settlement (Uniswap v4):** KeeperHub submits **`executeDarkPoolSwap`** on our deployed **`ShadowMeshHook`**. The hook calls **`PoolManager.unlock` → `swap`**, runs **`beforeSwap`** (EIP-712 verification, seller `tokenOut` settlement, ERC-6909 mint to the seller), then in **`unlockCallback`** pulls **`tokenIn`** from the buyer and uses **`take`** to deliver **`tokenOut`** to the buyer so PoolManager deltas net to zero—no `PoolSwapTest` / Universal Router leg.
 
 ---
 
@@ -42,8 +42,6 @@ seller-config.json: Set the listening port (e.g., 8001), point the identity to s
 Global Backend Configuration (backend/.env)
 UNISWAP_API_KEY: API key for Uniswap developer services.
 
-ROUTER_ADDRESS: Uniswap v4 Universal Router address on Sepolia.
-
 GEMINI_API_KEY: API key for the Gemini LLM powering the negotiation.
 
 POOL_MANAGER_ADDRESS: Uniswap v4 PoolManager address.
@@ -52,7 +50,7 @@ MOCK_WETH_ADDRESS: Deployed mock WETH address.
 
 MOCK_USDC_ADDRESS: Deployed mock USDC address.
 
-SHADOW_MESH_HOOK_ADDRESS: The CREATE2 mined address of our Hook.
+SHADOW_MESH_HOOK_ADDRESS: The CREATE2-mined address of **`ShadowMeshHook`**. Used as the EIP-712 **`verifyingContract`**, as the **KeeperHub `contract_address`** for settlement (**`executeDarkPoolSwap`**), and as the **ERC-20 `spender`** the buyer must **`approve`** for **`tokenIn`** (the buyer agent sends this approval before calling KeeperHub). The hook’s on-chain **`authorizedKeeper`** must match the **`KEEPER`** wallet you set in **`contracts/.env`** when deploying.
 
 SEPOLIA_RPC_URL: Your Alchemy/Infura RPC endpoint.
 
@@ -65,7 +63,7 @@ AGENT_B_PRIVATE_KEY: Seller's wallet private key (for EIP-712 signing).
 Buyer Agent Specifics (backend/.env.buyer)
 KEEPERHUB_API_KEY: Authentication for stealth relaying via KeeperHub.
 
-ROUTER_ADDRESS: (Same as global).
+SHADOW_MESH_HOOK_ADDRESS: Must match the deployed hook (same as global). Settlement targets this contract, not a router.
 
 SELLER_ADDRESS: Wallet address of the opposing (Seller) agent.
 
@@ -84,7 +82,7 @@ How to procure: curl.exe -s http://127.0.0.1:9001/topology, this generates a pub
 Seller Agent Specifics (backend/.env.seller)
 KEEPERHUB_API_KEY: Authentication for stealth relaying.
 
-ROUTER_ADDRESS: (Same as global).
+SHADOW_MESH_HOOK_ADDRESS: Must match the deployed hook (EIP-712 domain and **`tokenOut`** approvals use the hook as **`spender`** where applicable).
 
 SELLER_ADDRESS: The Seller's own wallet address.
 
@@ -107,7 +105,7 @@ SEPOLIA_PRIVATE_KEY: Deployer wallet private key.
 
 POOL_MANAGER: Uniswap v4 PoolManager address.
 
-KEEPER: The official KeeperHub wallet address (to grant contract execution permissions).
+KEEPER: The KeeperHub execution wallet address. This value is passed into the hook constructor as **`authorizedKeeper`** and must be the same wallet KeeperHub uses to call **`executeDarkPoolSwap`**.
 
 🏗️ Deployment & Execution Instructions
 Phase 1: Smart Contracts (/contracts)
@@ -192,8 +190,8 @@ As KeeperHub noted, "Agents are great at reasoning, but they hit a wall when the
 When our AI agents reach consensus over the Gensyn mesh, they generate an EIP-712 signed `DarkPoolIntent`. If broadcast normally, this payload would be sniped in the public mempool. 
 
 **How we exceed the Judging Criteria:**
-* **The Integration Approach:** We utilize KeeperHub as a **Stealth Relayer**. The winning agent bundles the mathematically perfected EIP-712 intent signatures and submits them directly via the KeeperHub MCP/API. 
-* **Real Utility:** KeeperHub bypasses the public mempool and routes our agent's execution directly to the Uniswap v4 Router. This guarantees that our trustless off-chain negotiation results in a 100% MEV-protected, guaranteed on-chain settlement. KeeperHub acts as the vital bridge between probabilistic AI reasoning and deterministic EVM execution.
+* **The Integration Approach:** We utilize KeeperHub as a **Stealth Relayer**. The buyer agent bundles the EIP-712 intent and signatures and submits them via the KeeperHub MCP/API as an **`execute_contract_call`** to **`ShadowMeshHook.executeDarkPoolSwap`** (Sepolia), with **`SHADOW_MESH_HOOK_ADDRESS`** as the target contract. 
+* **Real Utility:** KeeperHub bypasses the public mempool and routes execution to our **`ShadowMeshHook.executeDarkPoolSwap`**, which drives **`PoolManager`** settlement in a single lock. That gives MEV-protected relaying from AI consensus to deterministic on-chain settlement without relying on **`PoolSwapTest`** or the Universal Router for this flow. KeeperHub acts as the bridge between probabilistic AI reasoning and deterministic EVM execution.
 
 ### 👥 Team & Project Info
 * **Project Name:** ShadowMesh

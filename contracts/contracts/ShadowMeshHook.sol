@@ -4,11 +4,13 @@ pragma solidity ^0.8.24;
 import {BaseHook} from "@uniswap/v4-periphery/src/utils/BaseHook.sol";
 import {Hooks} from "@uniswap/v4-periphery/lib/v4-core/src/libraries/Hooks.sol";
 import {IPoolManager} from "@uniswap/v4-periphery/lib/v4-core/src/interfaces/IPoolManager.sol";
+import {IUnlockCallback} from "@uniswap/v4-periphery/lib/v4-core/src/interfaces/callback/IUnlockCallback.sol";
 import {IERC20Minimal} from "@uniswap/v4-periphery/lib/v4-core/src/interfaces/external/IERC20Minimal.sol";
 import {PoolKey} from "@uniswap/v4-periphery/lib/v4-core/src/types/PoolKey.sol";
 import {SwapParams} from "@uniswap/v4-periphery/lib/v4-core/src/types/PoolOperation.sol";
 import {BeforeSwapDelta, toBeforeSwapDelta} from "@uniswap/v4-periphery/lib/v4-core/src/types/BeforeSwapDelta.sol";
 import {Currency, CurrencyLibrary} from "@uniswap/v4-periphery/lib/v4-core/src/types/Currency.sol";
+import {TransientStateLibrary} from "@uniswap/v4-periphery/lib/v4-core/src/libraries/TransientStateLibrary.sol";
 import {EIP712} from "@openzeppelin/contracts/utils/cryptography/EIP712.sol";
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {Ownable2Step} from "@openzeppelin/contracts/access/Ownable2Step.sol";
@@ -18,8 +20,10 @@ import {SignatureChecker} from "@openzeppelin/contracts/utils/cryptography/Signa
 /// @title ShadowMeshHook
 /// @notice Uniswap v4 JIT OTC dark pool hook for AI-negotiated intents.
 /// @dev Validates buyer/seller EIP-712 signatures and uses beforeSwapReturnDelta to bypass AMM math.
-contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
+/// Relayer calls `executeDarkPoolSwap` → `unlock` → `swap`; the hook settles open deltas on itself (buyer pays tokenIn, buyer receives tokenOut).
+contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces, IUnlockCallback {
     using CurrencyLibrary for Currency;
+    using TransientStateLibrary for IPoolManager;
 
     struct DarkPoolIntent {
         address tokenIn;
@@ -53,9 +57,17 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
     error ExactOutputUnsupported();
     error AmountTooLarge(uint256 amount);
     error SellerTransferFailed(address token, address seller, uint256 amount);
-    error PoolManagerSettlementMismatch(address token, uint256 paid, uint256 expected);
+    error PoolManagerSettlementMismatch(
+        address token,
+        uint256 paid,
+        uint256 expected
+    );
     error OwnershipRenounceDisabled();
     error ZeroAddress();
+    error NotAuthorizedKeeper();
+    error UnexpectedHookCurrencyDebt(address currency);
+    error UnexpectedHookCurrencyCredit(address currency);
+    error ManagerDeltaNotZero();
 
     event KeeperUpdated(address indexed oldKeeper, address indexed newKeeper);
     event AllowedSwapSenderUpdated(address indexed account, bool allowed);
@@ -78,6 +90,9 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
             revert ZeroAddress();
         }
         authorizedKeeper = initialKeeper;
+
+        allowedSwapSender[address(this)] = true;
+        emit AllowedSwapSenderUpdated(address(this), true);
 
         uint256 len = initialAllowedSwapSenders.length;
         for (uint256 i = 0; i < len; i++) {
@@ -125,10 +140,11 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
             revert SwapSenderNotAllowed(sender);
         }
 
-        (DarkPoolIntent memory intent, bytes memory buyerSig, bytes memory sellerSig) = abi.decode(
-            hookData,
-            (DarkPoolIntent, bytes, bytes)
-        );
+        (
+            DarkPoolIntent memory intent,
+            bytes memory buyerSig,
+            bytes memory sellerSig
+        ) = abi.decode(hookData, (DarkPoolIntent, bytes, bytes));
 
         if (block.timestamp > intent.deadline) {
             revert IntentExpired(intent.deadline);
@@ -154,6 +170,41 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
         return (BaseHook.beforeSwap.selector, noOpDelta, 0);
     }
 
+    /// @notice Entry for KeeperHub (or any `authorizedKeeper`) to run the dark-pool swap inside a PoolManager lock.
+    function executeDarkPoolSwap(
+        PoolKey calldata key,
+        SwapParams calldata params,
+        bytes calldata hookData
+    ) external {
+        if (msg.sender != authorizedKeeper) {
+            revert NotAuthorizedKeeper();
+        }
+        poolManager.unlock(abi.encode(key, params, hookData));
+    }
+
+    /// @inheritdoc IUnlockCallback
+    function unlockCallback(bytes calldata data)
+        external
+        override
+        onlyPoolManager
+        returns (bytes memory)
+    {
+        (PoolKey memory key, SwapParams memory params, bytes memory hookData) =
+            abi.decode(data, (PoolKey, SwapParams, bytes));
+
+        poolManager.swap(key, params, hookData);
+
+        (DarkPoolIntent memory intent,,) = abi.decode(hookData, (DarkPoolIntent, bytes, bytes));
+
+        _clearHookDeltaOnCurrency(key.currency0, intent);
+        _clearHookDeltaOnCurrency(key.currency1, intent);
+
+        if (poolManager.getNonzeroDeltaCount() != 0) {
+            revert ManagerDeltaNotZero();
+        }
+        return "";
+    }
+
     function setAuthorizedKeeper(address newKeeper) external onlyOwner {
         if (newKeeper == address(0)) {
             revert ZeroAddress();
@@ -163,7 +214,10 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
         emit KeeperUpdated(oldKeeper, newKeeper);
     }
 
-    function setAllowedSwapSender(address account, bool allowed) external onlyOwner {
+    function setAllowedSwapSender(
+        address account,
+        bool allowed
+    ) external onlyOwner {
         if (account == address(0)) {
             revert ZeroAddress();
         }
@@ -199,8 +253,16 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
         bytes32 digest = _hashTypedDataV4(structHash);
 
         if (
-            !SignatureChecker.isValidSignatureNow(intent.buyer, digest, buyerSig)
-                || !SignatureChecker.isValidSignatureNow(intent.seller, digest, sellerSig)
+            !SignatureChecker.isValidSignatureNow(
+                intent.buyer,
+                digest,
+                buyerSig
+            ) ||
+            !SignatureChecker.isValidSignatureNow(
+                intent.seller,
+                digest,
+                sellerSig
+            )
         ) {
             revert InvalidAISignature();
         }
@@ -212,17 +274,22 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
         SwapParams calldata params
     ) internal view {
         if (
-            intent.tokenIn == address(0) || intent.tokenOut == address(0)
-                || intent.buyer == address(0) || intent.seller == address(0)
-                || intent.tokenIn == intent.tokenOut || intent.buyer == intent.seller
-                || intent.amountIn == 0 || intent.amountOut == 0
+            intent.tokenIn == address(0) ||
+            intent.tokenOut == address(0) ||
+            intent.buyer == address(0) ||
+            intent.seller == address(0) ||
+            intent.tokenIn == intent.tokenOut ||
+            intent.buyer == intent.seller ||
+            intent.amountIn == 0 ||
+            intent.amountOut == 0
         ) {
             revert InvalidIntent();
         }
 
         if (
-            address(key.hooks) != address(this) || key.fee != intent.fee
-                || key.tickSpacing != intent.tickSpacing
+            address(key.hooks) != address(this) ||
+            key.fee != intent.fee ||
+            key.tickSpacing != intent.tickSpacing
         ) {
             revert InvalidSwap();
         }
@@ -237,7 +304,10 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
             revert InvalidSwap();
         }
 
-        if (params.amountSpecified >= 0 || params.amountSpecified == type(int256).min) {
+        if (
+            params.amountSpecified >= 0 ||
+            params.amountSpecified == type(int256).min
+        ) {
             revert ExactOutputUnsupported();
         }
 
@@ -247,27 +317,58 @@ contract ShadowMeshHook is BaseHook, EIP712, Ownable2Step, Nonces {
         }
     }
 
-    function _settleExactInputOTC(DarkPoolIntent memory intent)
-        internal
-        returns (BeforeSwapDelta)
-    {
+    function _settleExactInputOTC(
+        DarkPoolIntent memory intent
+    ) internal returns (BeforeSwapDelta) {
         Currency tokenIn = Currency.wrap(intent.tokenIn);
         Currency tokenOut = Currency.wrap(intent.tokenOut);
 
         poolManager.sync(tokenOut);
-        _transferFrom(tokenOut, intent.seller, address(poolManager), intent.amountOut);
+        _transferFrom(
+            tokenOut,
+            intent.seller,
+            address(poolManager),
+            intent.amountOut
+        );
         uint256 paid = poolManager.settle();
 
         if (paid != intent.amountOut) {
-            revert PoolManagerSettlementMismatch(intent.tokenOut, paid, intent.amountOut);
+            revert PoolManagerSettlementMismatch(
+                intent.tokenOut,
+                paid,
+                intent.amountOut
+            );
         }
 
-        poolManager.take(tokenIn, intent.seller, intent.amountIn);
+        poolManager.mint(intent.seller, tokenIn.toId(), intent.amountIn);
 
-        int128 deltaSpecified =  -_toInt128(intent.amountIn);
+        // Exact input uses negative `amountSpecified`; Hooks adds `hookDeltaSpecified` to zero the pool leg (see Uniswap `Hooks.beforeSwap`).
+        int128 deltaSpecified = _toInt128(intent.amountIn);
         int128 deltaUnspecified = _toInt128(intent.amountOut);
 
         return toBeforeSwapDelta(deltaSpecified, deltaUnspecified);
+    }
+
+    function _clearHookDeltaOnCurrency(Currency currency, DarkPoolIntent memory intent) private {
+        int256 d = poolManager.currencyDelta(address(this), currency);
+        if (d == 0) {
+            return;
+        }
+        address token = Currency.unwrap(currency);
+        if (d < 0) {
+            if (token != intent.tokenIn) {
+                revert UnexpectedHookCurrencyDebt(token);
+            }
+            uint256 owe = uint256(-d);
+            poolManager.sync(currency);
+            _transferFrom(currency, intent.buyer, address(poolManager), owe);
+            poolManager.settle();
+        } else {
+            if (token != intent.tokenOut) {
+                revert UnexpectedHookCurrencyCredit(token);
+            }
+            poolManager.take(currency, intent.buyer, uint256(d));
+        }
     }
 
     function _transferFrom(

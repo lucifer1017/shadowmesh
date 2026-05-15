@@ -1,5 +1,4 @@
 import { readFile, writeFile } from "node:fs/promises";
-
 import { artifacts, network } from "hardhat";
 import {
   concatHex,
@@ -13,11 +12,11 @@ import {
   type Hex,
 } from "viem";
 
-// Mirrors v4-core `Hooks.ALL_HOOK_MASK` and permission flags (least significant 14 bits of hook address).
-const FLAG_MASK = (1n << 14n) - 1n;
+// THE CORRECT LOW-BIT MATH (v4-periphery BaseHook validation)
 const BEFORE_SWAP_FLAG = 1n << 7n;
 const BEFORE_SWAP_RETURNS_DELTA_FLAG = 1n << 3n;
 const REQUIRED_HOOK_FLAGS = BEFORE_SWAP_FLAG | BEFORE_SWAP_RETURNS_DELTA_FLAG;
+const FLAG_MASK = (1n << 14n) - 1n;
 const MAX_SALT_ATTEMPTS = 5_000_000n;
 const ZERO_ADDRESS = "0x0000000000000000000000000000000000000000";
 const parametersPath = new URL("../ignition/parameters.json", import.meta.url);
@@ -32,7 +31,7 @@ type ShadowMeshParameters = {
 
 function requireAddress(value: string | undefined, name: string): Address {
   if (value === undefined || !isAddress(value) || getAddress(value) === ZERO_ADDRESS) {
-    throw new Error(`Missing or invalid ${name} in .env (or fallback ignition/parameters.json)`);
+    throw new Error(`Missing or invalid ${name} in .env`);
   }
   return getAddress(value);
 }
@@ -51,15 +50,10 @@ async function main() {
   const parameters = JSON.parse(rawParameters) as ShadowMeshParameters;
   const moduleParameters = parameters.ShadowMeshModule ?? {};
 
-  const poolManager = requireAddress(
-    process.env.POOL_MANAGER ?? moduleParameters.poolManager,
-    "POOL_MANAGER",
-  );
-  const keeper = requireAddress(process.env.KEEPER ?? moduleParameters.keeper, "KEEPER");
+  // 1. Load Addresses
+  const poolManager = requireAddress(process.env.POOL_MANAGER ?? moduleParameters.poolManager, "POOL_MANAGER");
+  const keeper = requireAddress(process.env.KEEPER ?? moduleParameters.keeper, "KEEPER"); // Your actual Keeper wallet
   const owner = deployerWallet.account.address;
-
-  const routerRaw = process.env.ROUTER_ADDRESS ?? "0x9B6b46e2c869aa39918Db7f52f5557FE577B6eEe";
-  const routerAddress = requireAddress(routerRaw, "ROUTER_ADDRESS");
 
   const create2Deployer = await viem.deployContract("Create2Deployer", []);
   const artifact = await artifacts.readArtifact("ShadowMeshHook");
@@ -69,6 +63,7 @@ async function main() {
     throw new Error("ShadowMeshHook bytecode is empty");
   }
 
+  // 2. Encode Constructor: Manager, Owner, Keeper Wallet, optional extra allowed swap senders (hook always allows `address(this)` in-contract).
   const constructorArgs = encodeAbiParameters(
     [
       { name: "_poolManager", type: "address" },
@@ -76,7 +71,7 @@ async function main() {
       { name: "initialKeeper", type: "address" },
       { name: "initialAllowedSwapSenders", type: "address[]" },
     ],
-    [poolManager, owner, keeper, [routerAddress]],
+    [poolManager, owner, keeper, []]
   );
 
   const creationCode = concatHex([bytecode, constructorArgs]);
@@ -86,17 +81,19 @@ async function main() {
   let salt = padHex("0x0", { size: 32 });
   let hookAddress = computeCreate2Address(create2Deployer.address, salt, creationCodeHash);
 
+  // 3. Mine the low-bits (0x88)
+  console.log(`⛏️ Mining hook address for flags 0x${REQUIRED_HOOK_FLAGS.toString(16)}...`);
   while ((hexToBigInt(hookAddress) & FLAG_MASK) !== REQUIRED_HOOK_FLAGS) {
     saltNumber++;
     if (saltNumber > MAX_SALT_ATTEMPTS) {
-      throw new Error(`Unable to mine hook flags 0x${REQUIRED_HOOK_FLAGS.toString(16)}`);
+      throw new Error(`Unable to mine hook flags`);
     }
     salt = padHex(`0x${saltNumber.toString(16)}`, { size: 32 });
     hookAddress = computeCreate2Address(create2Deployer.address, salt, creationCodeHash);
   }
 
+  // 4. Deploy
   const existingCode = await publicClient.getBytecode({ address: hookAddress });
-
   if (existingCode === undefined || existingCode === "0x") {
     const txHash = await create2Deployer.write.deploy([salt, creationCode]);
     await publicClient.waitForTransactionReceipt({ hash: txHash });
@@ -107,34 +104,20 @@ async function main() {
     throw new Error("ShadowMeshHook deployment failed");
   }
 
+  // 5. Verify State — hook must allow itself as swap sender (custom router path).
   const shadowMeshHook = await viem.getContractAt("ShadowMeshHook", hookAddress);
-  const deployedPoolManager = await shadowMeshHook.read.poolManager();
-  const deployedKeeper = await shadowMeshHook.read.authorizedKeeper();
-  const deployedOwner = await shadowMeshHook.read.owner();
-  const routerAllowed = await shadowMeshHook.read.allowedSwapSender([routerAddress]);
+  const hookSelfAllowed = await shadowMeshHook.read.allowedSwapSender([hookAddress]);
 
-  if (
-    getAddress(deployedPoolManager) !== poolManager
-    || getAddress(deployedKeeper) !== keeper
-    || getAddress(deployedOwner) !== getAddress(owner)
-    || !routerAllowed
-  ) {
-    throw new Error("Deployed ShadowMeshHook constructor state mismatch");
+  if (!hookSelfAllowed) {
+    throw new Error("Hook did not set allowedSwapSender[hook] during deployment!");
   }
 
-  parameters.ShadowMeshModule = {
-    ...moduleParameters,
-    shadowMeshHook: hookAddress,
-  };
-
+  parameters.ShadowMeshModule = { ...moduleParameters, shadowMeshHook: hookAddress };
   await writeFile(parametersPath, `${JSON.stringify(parameters, null, 2)}\n`);
 
-  console.log("Create2Deployer:", create2Deployer.address);
+  console.log("✅ Deployment Successful!");
   console.log("ShadowMeshHook:", hookAddress);
-  console.log("Allowed swap sender (router):", routerAddress);
-  console.log("Required hook flags:", `0x${REQUIRED_HOOK_FLAGS.toString(16)}`);
-  console.log("Salt:", salt);
-  console.log("Updated ignition/parameters.json");
+  console.log("allowedSwapSender[hook]:", hookSelfAllowed);
 }
 
 await main();

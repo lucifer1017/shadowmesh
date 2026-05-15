@@ -3,7 +3,16 @@ import axios from "axios";
 import { GoogleGenAI, Type } from "@google/genai";
 import { Client } from "@modelcontextprotocol/sdk/client";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp";
-import { parseUnits, encodeAbiParameters, createPublicClient, http, type Hex, getAddress, isAddress } from "viem";
+import {
+  parseUnits,
+  encodeAbiParameters,
+  createPublicClient,
+  createWalletClient,
+  http,
+  type Hex,
+  getAddress,
+  isAddress,
+} from "viem";
 import { sepolia } from "viem/chains";
 import { generatePrivateKey, privateKeyToAccount } from "viem/accounts";
 
@@ -144,7 +153,7 @@ function resolveHookAddress(): `0x${string}` {
     process.env.SHADOW_MESH_HOOK_ADDRESS
     ?? "0xb76306D31e12336F0D8C62497190ae49f06Bc080";
   if (!isAddress(raw)) {
-    throw new Error("Missing or invalid SHADOW_MESH_HOOK (or SHADOWMESH_HOOK_ADDRESS)");
+    throw new Error("Missing or invalid SHADOW_MESH_HOOK_ADDRESS (or default hook address)");
   }
   return getAddress(raw);
 }
@@ -187,11 +196,11 @@ const NONCES_ABI = [
   },
 ] as const;
 
-const POOL_SWAP_TEST_ABI = JSON.stringify([
+const EXECUTE_DARK_POOL_SWAP_ABI = JSON.stringify([
   {
-    name: "swap",
+    name: "executeDarkPoolSwap",
     type: "function",
-    stateMutability: "payable",
+    stateMutability: "nonpayable",
     inputs: [
       {
         name: "key",
@@ -213,19 +222,34 @@ const POOL_SWAP_TEST_ABI = JSON.stringify([
           { name: "sqrtPriceLimitX96", type: "uint160" },
         ],
       },
-      {
-        name: "testSettings",
-        type: "tuple",
-        components: [
-          { name: "takeClaims",      type: "bool" },
-          { name: "settleUsingBurn", type: "bool" },
-        ],
-      },
       { name: "hookData", type: "bytes" },
     ],
-    outputs: [{ name: "delta", type: "int256" }],
+    outputs: [],
   },
 ]);
+
+const ERC20_ALLOWANCE_APPROVE_ABI = [
+  {
+    name: "allowance",
+    type: "function",
+    stateMutability: "view",
+    inputs: [
+      { name: "owner",   type: "address" },
+      { name: "spender", type: "address" },
+    ],
+    outputs: [{ name: "", type: "uint256" }],
+  },
+  {
+    name: "approve",
+    type: "function",
+    stateMutability: "nonpayable",
+    inputs: [
+      { name: "spender", type: "address" },
+      { name: "amount",  type: "uint256" },
+    ],
+    outputs: [{ name: "", type: "bool" }],
+  },
+] as const;
 
 const HOOK_DATA_ENCODE_PARAMS = [
   {
@@ -248,9 +272,15 @@ const HOOK_DATA_ENCODE_PARAMS = [
   { type: "bytes" },
 ] as const;
 
+const sepoliaTransport = http(process.env.SEPOLIA_RPC_URL ?? "https://rpc.sepolia.org");
 const publicClient = createPublicClient({
   chain: sepolia,
-  transport: http(process.env.SEPOLIA_RPC_URL ?? "https://rpc.sepolia.org"),
+  transport: sepoliaTransport,
+});
+const walletClient = createWalletClient({
+  account,
+  chain: sepolia,
+  transport: sepoliaTransport,
 });
 
 const responseSchema = {
@@ -638,6 +668,30 @@ function keeperHubExecutionLooksSuccessful(o: Record<string, unknown> | null): b
   return false;
 }
 
+async function ensureBuyerTokenInApprovalForHook(intent: DarkPoolIntentArg): Promise<void> {
+  const buyer = getAddress(account.address);
+  if (getAddress(intent.buyer) !== buyer) {
+    throw new Error("Intent buyer must match the buyer agent wallet (signing account).");
+  }
+  const tokenIn = getAddress(intent.tokenIn);
+  const allowance = await publicClient.readContract({
+    address:  tokenIn,
+    abi:      ERC20_ALLOWANCE_APPROVE_ABI,
+    functionName: "allowance",
+    args:     [buyer, HOOK_ADDRESS],
+  });
+  if (allowance >= intent.amountIn) {
+    return;
+  }
+  const hash = await walletClient.writeContract({
+    address:      tokenIn,
+    abi:          ERC20_ALLOWANCE_APPROVE_ABI,
+    functionName: "approve",
+    args:         [HOOK_ADDRESS, intent.amountIn],
+  });
+  await publicClient.waitForTransactionReceipt({ hash });
+}
+
 async function waitForDirectExecutionTerminal(executionId: string): Promise<string> {
   const maxWaitMs = 90_000;
   const intervalMs = 2_000;
@@ -668,8 +722,7 @@ async function submitToKeeperHub(
   buyerSig: `0x${string}`,
   sellerSig: `0x${string}`,
 ): Promise<void> {
-  const router = process.env.ROUTER_ADDRESS?.trim();
-  if (!router) throw new Error("Missing ROUTER_ADDRESS in .env.buyer");
+  await ensureBuyerTokenInApprovalForHook(intent);
 
   const hookData = packHookData(intent, buyerSig, sellerSig);
 
@@ -694,10 +747,8 @@ async function submitToKeeperHub(
     sqrtPriceLimitX96: (zeroForOne ? MIN_PRICE_LIMIT : MAX_PRICE_LIMIT).toString(),
   };
 
-  const testSettings = { takeClaims: false, settleUsingBurn: false };
-
   const functionArgs = JSON.stringify(
-    [poolKey, swapParams, testSettings, hookData],
+    [poolKey, swapParams, hookData],
     bigintReplacer,
   );
 
@@ -705,11 +756,11 @@ async function submitToKeeperHub(
     const result = await keeperHubClient.callTool({
       name: "execute_contract_call",
       arguments: {
-        contract_address: router,
+        contract_address: HOOK_ADDRESS,
         network:          "11155111",
-        function_name:    "swap",
+        function_name:    "executeDarkPoolSwap",
         function_args:    functionArgs,
-        abi:              POOL_SWAP_TEST_ABI,
+        abi:              EXECUTE_DARK_POOL_SWAP_ABI,
       },
     });
     if (isObject(result) && result.isError === true) {
@@ -1009,16 +1060,64 @@ async function pollIncomingMessages() {
   }
 }
 
+// async function initKeeperHubMcp(): Promise<void> {
+//   const apiKey = process.env.KEEPERHUB_API_KEY?.replace(/['"]/g, '').trim();
+//   if (!apiKey) {
+//     throw new Error("Missing KEEPERHUB_API_KEY in environment.");
+//   }
+
+//   const transport = new StreamableHTTPClientTransport(new URL("https://app.keeperhub.com/mcp"), {
+//     requestInit: {
+//       headers: {
+//         Authorization: `Bearer ${apiKey}`,
+//       },
+//     },
+//   });
+
+//   transport.onerror = (error) => {
+//     console.error("KeeperHub MCP transport error:", error);
+//   };
+
+//   transport.onclose = () => {
+//     console.warn("KeeperHub MCP transport closed.");
+//   };
+
+//   await keeperHubClient.connect(transport);
+//   console.log("✅ KeeperHub MCP Connected!");
+
+//   const { tools } = await keeperHubClient.listTools();
+//   const toolNames = tools.map((tool) => tool.name);
+//   console.log(
+//     `🛠️ KeeperHub tools loaded (${toolNames.length}): ${
+//       toolNames.length ? toolNames.join(", ") : "(none)"
+//     }`
+//   );
+// }
+
 async function initKeeperHubMcp(): Promise<void> {
   const apiKey = process.env.KEEPERHUB_API_KEY?.replace(/['"]/g, '').trim();
   if (!apiKey) {
     throw new Error("Missing KEEPERHUB_API_KEY in environment.");
   }
 
+  // Injecting the complete suite of Chrome Client Hints to spoof Cloudflare WAF
   const transport = new StreamableHTTPClientTransport(new URL("https://app.keeperhub.com/mcp"), {
     requestInit: {
       headers: {
-        Authorization: `Bearer ${apiKey}`,
+        "Authorization": `Bearer ${apiKey}`,
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Content-Type": "application/json",
+        "Connection": "keep-alive",
+        "sec-ch-ua": '"Google Chrome";v="120", "Chromium";v="120", "Not=A?Brand";v="99"',
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Origin": "https://app.keeperhub.com",
+        "Referer": "https://app.keeperhub.com/"
       },
     },
   });
